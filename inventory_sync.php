@@ -24,7 +24,35 @@ define('CSV_SKU_COL', 'Variant SKU');
 define('CSV_QTY_COL', 'Inventory Available: Cafol DE');
 
 define('LOCAL_CSV_DIR', __DIR__ . '/csv_files');
-define('LOG_FILE', __DIR__ . '/sync_' . date('Ymd_His') . '.log');
+define('LOG_DIR', __DIR__ . '/logs');
+
+$logEchoOverride = getenv('SYNC_LOG_ECHO');
+if ($logEchoOverride !== false) {
+  $value = strtolower(trim($logEchoOverride));
+  $logEcho = in_array($value, ['1', 'true', 'yes', 'on'], true);
+} else {
+  $logEcho = false;
+  if (defined('STDOUT')) {
+    if (function_exists('stream_isatty') && @stream_isatty(STDOUT)) {
+      $logEcho = true;
+    } elseif (function_exists('posix_isatty') && @posix_isatty(STDOUT)) {
+      $logEcho = true;
+    }
+  }
+  if (!$logEcho) {
+    $term = getenv('TERM');
+    if (PHP_SAPI === 'cli' && $term && strtolower($term) !== 'dumb') {
+      $logEcho = true;
+    }
+  }
+}
+define('LOG_ECHO_ENABLED', $logEcho); // quiet for cron, override with SYNC_LOG_ECHO=1
+
+if (!is_dir(LOG_DIR) && !mkdir(LOG_DIR, 0777, true) && !is_dir(LOG_DIR)) {
+  fwrite(STDERR, "Cannot create log directory: " . LOG_DIR . PHP_EOL);
+  exit(1);
+}
+define('LOG_FILE', LOG_DIR . '/sync_' . date('Ymd_His') . '.log');
 
 // VentoryOne (2116 = cafol warehouse)
 define('VO_BASE', 'https://app.ventory.one');
@@ -46,7 +74,9 @@ define('REQUEST_TIMEOUT', 45);
 /* ================ LOGGING ================= */
 function logMsg($msg) {
   $line = '[' . date('Y-m-d H:i:s') . '] ' . $msg . PHP_EOL;
-  echo $line;
+  if (LOG_ECHO_ENABLED) {
+    echo $line;
+  }
   file_put_contents(LOG_FILE, $line, FILE_APPEND);
 }
 
@@ -164,44 +194,277 @@ function normalizeVoSku($sku) {
   return preg_replace('/-FBM$/', '', $sku);
 }
 
-/* ============ VentoryOne ============ */
-function voSetCartonsZero($skuBase) {
-  $url = VO_BASE . '/api/update_plain_carton_line_item_qty/';
-  $headers = [
-    'Authorization: Bearer ' . VO_TOKEN,
-    'Content-Type: application/json',
-    'Accept: application/json'
-  ];
-  $payload = [
-    'warehouse_id' => VO_WAREHOUSE_ID,
-    'sku_qty_list' => [[
-      'sku'        => $skuBase,
-      'carton_qty' => 0
-    ]]
-  ];
-  [$code, $resp] = httpJsonWithRetry($url, 'POST', $headers, $payload);
-  return $code >= 200 && $code < 300;
+function extractIntFromMixed($value) {
+  if (is_int($value)) return $value;
+  if (is_float($value)) return (int)round($value);
+  if (is_string($value) && preg_match('/^-?\d+$/', trim($value))) {
+    return (int)trim($value);
+  }
+  return null;
 }
 
-function voSetLooseToTotal($skuBase, $total) {
-  $url = VO_BASE . '/api/update_loose_stock/';
-  $headers = [
-    'Authorization: Bearer ' . VO_TOKEN,
-    'Content-Type: application/json',
-    'Accept: application/json'
-  ];
-  $payload = [
-    'warehouse_id' => VO_WAREHOUSE_ID,
-    'sku_qty_list' => [[
-      'sku'               => $skuBase,
-      'pcs_in_loose_stock'=> (int)$total
-    ]]
-  ];
-  [$code, $resp] = httpJsonWithRetry($url, 'POST', $headers, $payload);
-  return $code >= 200 && $code < 300;
+function collectStrings($value, array &$out) {
+  if (is_string($value)) {
+    $trimmed = trim($value);
+    if ($trimmed !== '') $out[] = $trimmed;
+    return;
+  }
+
+  if (is_array($value)) {
+    foreach ($value as $item) collectStrings($item, $out);
+    return;
+  }
+
+  if (is_object($value)) {
+    foreach (get_object_vars($value) as $item) collectStrings($item, $out);
+  }
 }
 
-function voVerifyLooseEquals($skuBase, $expect) {
+function collectWarehouseIds($value, array &$out) {
+  if ($value === null) return;
+
+  if (is_int($value)) {
+    $out[] = $value;
+    return;
+  }
+
+  if (is_string($value) && preg_match('/^-?\d+$/', trim($value))) {
+    $out[] = (int)trim($value);
+    return;
+  }
+
+  if (is_float($value)) {
+    $out[] = (int)$value;
+    return;
+  }
+
+  if (is_array($value)) {
+    foreach ($value as $key => $item) {
+      if (is_string($key)) {
+        $lower = strtolower($key);
+        if (strpos($lower, 'warehouse') !== false || strpos($lower, 'id') !== false) {
+          collectWarehouseIds($item, $out);
+        }
+      } else {
+        collectWarehouseIds($item, $out);
+      }
+    }
+    return;
+  }
+
+  if (is_object($value)) {
+    collectWarehouseIds(get_object_vars($value), $out);
+  }
+}
+
+function extractSkuCandidates(array $row) {
+  $preferredKeys = [
+    'sku', 'sku_code', 'skuCode', 'sku_name', 'skuName', 'sku_full_name',
+    'skuFullName', 'sku_display_name', 'skuDisplayName', 'name', 'skuValue',
+    'sku_value', 'sku_number', 'skuNumber'
+  ];
+
+  $candidates = [];
+
+  foreach ($preferredKeys as $key) {
+    if (!array_key_exists($key, $row)) continue;
+    collectStrings($row[$key], $candidates);
+  }
+
+  if (!$candidates) {
+    // Fallback: scan nested structures for matching strings.
+    collectStrings($row, $candidates);
+  }
+
+  $candidates = array_values(array_unique(array_filter($candidates, fn($s) => $s !== '')));
+
+  return $candidates;
+}
+
+function extractWarehouseIds(array $row) {
+  $ids = [];
+
+  foreach (['warehouse_id', 'warehouse', 'warehouse_info'] as $key) {
+    if (!array_key_exists($key, $row)) continue;
+    collectWarehouseIds($row[$key], $ids);
+  }
+
+  $ids = array_values(array_unique(array_map('intval', $ids)));
+
+  return $ids;
+}
+
+function stockKeywordScore($text) {
+  if (!is_string($text) || $text === '') return 0;
+
+  $lower = strtolower($text);
+  $keywords = [
+    'stk' => 8,
+    'insgesamt' => 7,
+    'gesamt' => 6,
+    'total' => 6,
+    'sum' => 4,
+    'loose' => 5,
+    'stock' => 5,
+    'inventory' => 4,
+    'qty' => 4,
+    'quantity' => 4,
+    'available' => 3,
+    'pcs' => 2,
+  ];
+
+  $score = 0;
+  foreach ($keywords as $kw => $weight) {
+    if (strpos($lower, $kw) !== false) {
+      $score += $weight;
+    }
+  }
+
+  return $score;
+}
+
+function normalizeIntValue($value) {
+  if (is_int($value)) {
+    return $value;
+  }
+
+  if (is_float($value)) {
+    return (int)round($value);
+  }
+
+  if (is_string($value)) {
+    $trimmed = trim($value);
+    if ($trimmed === '') return null;
+    if (!preg_match('/^-?\d+(?:[\.,]\d+)?$/', $trimmed)) return null;
+    $normalized = str_replace(',', '.', $trimmed);
+    return (int)round((float)$normalized);
+  }
+
+  return null;
+}
+
+function addStockMetricCandidate(array &$candidates, $label, $value, $score) {
+  $intValue = normalizeIntValue($value);
+  if ($intValue === null) return;
+  if ($score <= 0) return;
+
+  $key = strtolower($label);
+  if (!isset($candidates[$key]) || $score > $candidates[$key]['score']) {
+    $candidates[$key] = [
+      'label' => $label,
+      'value' => $intValue,
+      'score' => $score,
+    ];
+  }
+}
+
+function collectStockMetricCandidates($value, array $path, array &$candidates) {
+  if (is_array($value)) {
+    $assoc = $value;
+  } elseif (is_object($value)) {
+    $assoc = get_object_vars($value);
+  } else {
+    $labelParts = array_filter($path, 'is_string');
+    if (!$labelParts) return;
+
+    $label = implode('.', $labelParts);
+    $score = stockKeywordScore($label);
+    addStockMetricCandidate($candidates, $label, $value, $score);
+    return;
+  }
+
+  // detect metric structures like {"name": "STK – Insgesamt", "value": 123}
+  $textKeys = ['name', 'label', 'title', 'metric', 'description', 'display_name', 'displayName'];
+  $valueKeys = ['value', 'qty', 'quantity', 'amount', 'total', 'count', 'stock', 'stock_qty', 'stockQty', 'quantity_total', 'quantityTotal'];
+
+  $textValue = null;
+  $textKeyUsed = null;
+  foreach ($textKeys as $textKey) {
+    if (array_key_exists($textKey, $assoc) && is_string($assoc[$textKey]) && trim($assoc[$textKey]) !== '') {
+      $textValue = trim($assoc[$textKey]);
+      $textKeyUsed = $textKey;
+      break;
+    }
+  }
+
+  if ($textValue !== null) {
+    foreach ($valueKeys as $valueKey) {
+      if (!array_key_exists($valueKey, $assoc)) continue;
+      $score = stockKeywordScore($valueKey) + stockKeywordScore($textValue);
+      $labelParts = array_merge(array_filter($path, 'is_string'), [$valueKey]);
+      $label = implode('.', $labelParts);
+      if ($textKeyUsed) {
+        $label .= ' [' . $textKeyUsed . '=' . $textValue . ']';
+      }
+      addStockMetricCandidate($candidates, $label, $assoc[$valueKey], $score);
+    }
+  }
+
+  foreach ($assoc as $key => $item) {
+    $nextPath = $path;
+    if (is_string($key) && $key !== '') {
+      $nextPath[] = $key;
+    } elseif (!empty($path) && is_int($key)) {
+      $nextPath[] = $key;
+    }
+    collectStockMetricCandidates($item, $nextPath, $candidates);
+  }
+}
+
+function extractStockMetric(array $row) {
+  $candidates = [];
+  collectStockMetricCandidates($row, [], $candidates);
+  if (!$candidates) return [null, null];
+
+  $sorted = array_values($candidates);
+  usort($sorted, function ($a, $b) {
+    if ($a['score'] === $b['score']) {
+      return $b['value'] <=> $a['value'];
+    }
+    return $b['score'] <=> $a['score'];
+  });
+
+  $best = $sorted[0];
+  return [$best['value'], $best['label']];
+}
+
+function voExtractMetricDetails(array $row) {
+  $metric = null;
+  $fieldUsed = null;
+
+  foreach ([
+    'stk_insgesamt',
+    'stkInsGesamt',
+    'stk-gesamt',
+    'stk_total',
+    'qty_total_stock',
+    'total_qty',
+    'total_stock',
+    'qty_loose_stock',
+    'loose_qty',
+    'qty',
+  ] as $field) {
+    if (!array_key_exists($field, $row)) continue;
+    $candidate = normalizeIntValue($row[$field]);
+    if ($candidate !== null) {
+      $metric = $candidate;
+      $fieldUsed = $field;
+      break;
+    }
+  }
+
+  if ($metric === null) {
+    [$metricCandidate, $metricLabel] = extractStockMetric($row);
+    if ($metricCandidate !== null) {
+      $metric = $metricCandidate;
+      $fieldUsed = $metricLabel ?: 'metric';
+    }
+  }
+
+  return [$metric, $fieldUsed];
+}
+
+function voFetchStockEntry($skuBase, &$note = null) {
   $headers = [
     'Authorization: Bearer ' . VO_TOKEN,
     'Accept: application/json'
@@ -212,21 +475,21 @@ function voVerifyLooseEquals($skuBase, $expect) {
     VO_BASE . '/api/current_stock/All/'
   ];
 
-  $lastNote = 'SKU not found in current_stock';
+  $note = 'SKU not found in current_stock';
 
   foreach ($attempts as $baseUrl) {
     if (!$baseUrl) continue;
     $url = $baseUrl;
     while ($url) {
-      [$code, $resp] = httpJsonWithRetry($url, 'GET', $headers, null);
+      [$code, $resp, $curlErr] = httpJsonWithRetry($url, 'GET', $headers, null);
       if (!($code >= 200 && $code < 300) || !$resp) {
-        $lastNote = 'HTTP ' . $code;
+        $note = $curlErr ? ('HTTP ' . $code . ' | ' . $curlErr) : ('HTTP ' . $code);
         break;
       }
 
       $json = json_decode($resp, true);
       if (!is_array($json)) {
-        $lastNote = 'Bad JSON';
+        $note = 'Bad JSON';
         break;
       }
 
@@ -235,46 +498,35 @@ function voVerifyLooseEquals($skuBase, $expect) {
         $rows = $json['results'];
       }
 
+      if (!is_array($rows)) {
+        $note = 'Unexpected payload';
+        break;
+      }
+
       foreach ($rows as $row) {
         if (!is_array($row)) continue;
 
-        $skuCandidate = (string)($row['sku'] ?? $row['sku_code'] ?? $row['skuName'] ?? '');
-
-        $warehouseRaw = $row['warehouse_id'] ?? $row['warehouse'] ?? null;
-        $warehouseId = null;
-        if (is_array($warehouseRaw)) {
-          $warehouseId = (int)($warehouseRaw['id'] ?? $warehouseRaw['pk'] ?? 0);
-        } elseif (is_object($warehouseRaw)) {
-          $warehouseId = (int)($warehouseRaw->id ?? $warehouseRaw->pk ?? 0);
-        } elseif ($warehouseRaw !== null) {
-          $warehouseId = (int)$warehouseRaw;
+        $matchedCandidate = null;
+        $skuMatches = false;
+        foreach (extractSkuCandidates($row) as $candidate) {
+          if (strcasecmp($candidate, $skuBase) === 0 || strcasecmp(normalizeVoSku($candidate), $skuBase) === 0) {
+            $matchedCandidate = $candidate;
+            $skuMatches = true;
+            break;
+          }
         }
 
-        if (strcasecmp($skuCandidate, $skuBase) === 0 && ($warehouseId === null || $warehouseId === VO_WAREHOUSE_ID)) {
-          $metric = null;
-          $fieldUsed = null;
-          foreach ([
-            'stk_insgesamt',
-            'qty_total_stock',
-            'total_qty',
-            'total_stock',
-            'qty_loose_stock',
-            'loose_qty',
-            'qty'
-          ] as $field) {
-            if (array_key_exists($field, $row)) {
-              $metric = (int)$row[$field];
-              $fieldUsed = $field;
-              break;
-            }
-          }
+        if (!$skuMatches) continue;
 
-          if ($metric === null) {
-            return [false, 'stock-metric-missing'];
-          }
-
-          return [$metric === (int)$expect, $fieldUsed . '=' . $metric];
+        $warehouseIds = extractWarehouseIds($row);
+        if ($warehouseIds && !in_array(VO_WAREHOUSE_ID, $warehouseIds, true)) {
+          continue;
         }
+
+        $row['_matched_candidate'] = $matchedCandidate ?: $skuBase;
+        $row['_warehouse_ids'] = $warehouseIds;
+
+        return $row;
       }
 
       $next = $json['next'] ?? null;
@@ -294,14 +546,201 @@ function voVerifyLooseEquals($skuBase, $expect) {
     }
   }
 
-  return [false, $lastNote];
+  return null;
+}
+
+function voExtractSkuId(array $row) {
+  foreach (['sku_id', 'skuId', 'id'] as $field) {
+    if (!array_key_exists($field, $row)) continue;
+    $value = extractIntFromMixed($row[$field]);
+    if ($value !== null) return $value;
+  }
+
+  if (isset($row['sku_obj'])) {
+    $obj = $row['sku_obj'];
+    if (is_array($obj)) {
+      foreach (['id', 'pk'] as $field) {
+        if (array_key_exists($field, $obj)) {
+          $value = extractIntFromMixed($obj[$field]);
+          if ($value !== null) return $value;
+        }
+      }
+    } elseif (is_object($obj)) {
+      foreach (['id', 'pk'] as $field) {
+        if (property_exists($obj, $field)) {
+          $value = extractIntFromMixed($obj->$field);
+          if ($value !== null) return $value;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function voExtractOrganizationId(array $row) {
+  foreach (['organization_id', 'organizationId', 'organization'] as $field) {
+    if (!array_key_exists($field, $row)) continue;
+    $value = extractIntFromMixed($row[$field]);
+    if ($value !== null) return $value;
+  }
+
+  if (isset($row['warehouse'])) {
+    $warehouse = $row['warehouse'];
+    if (is_array($warehouse) && array_key_exists('organization', $warehouse)) {
+      $value = extractIntFromMixed($warehouse['organization']);
+      if ($value !== null) return $value;
+    }
+    if (is_object($warehouse) && property_exists($warehouse, 'organization')) {
+      $value = extractIntFromMixed($warehouse->organization);
+      if ($value !== null) return $value;
+    }
+  }
+
+  return null;
+}
+
+function voPostAndCheck($path, array $payload) {
+  $url = rtrim(VO_BASE, '/') . '/' . ltrim($path, '/');
+  $headers = [
+    'Authorization: Bearer ' . VO_TOKEN,
+    'Content-Type: application/json',
+    'Accept: application/json'
+  ];
+
+  [$code, $resp, $curlErr, $verbose] = httpJsonWithRetry($url, 'POST', $headers, $payload);
+
+  if (!($code >= 200 && $code < 300)) {
+    $extra = $curlErr ?: trim($verbose);
+    return [false, 'HTTP ' . $code . ($extra ? ' | ' . $extra : '')];
+  }
+
+  if ($resp === null || $resp === '') {
+    return [true, ''];
+  }
+
+  $json = json_decode($resp, true);
+  if (!is_array($json)) {
+    return [true, trim($resp)];
+  }
+
+  if (isset($json['errors']) && !empty($json['errors'])) {
+    return [false, 'errors=' . json_encode($json['errors'])];
+  }
+
+  if (isset($json['success'])) {
+    $success = filter_var($json['success'], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+    if ($success === false) {
+      return [false, 'success flag false'];
+    }
+  }
+
+  $message = '';
+  if (isset($json['message']) && is_string($json['message'])) {
+    $message = trim($json['message']);
+    if (preg_match('/(not found|invalid|error|failed)/i', $message)) {
+      return [false, 'message=' . $message];
+    }
+  }
+
+  return [true, $message];
+}
+
+/* ============ VentoryOne ============ */
+function voSetCartonsZero(array $ident) {
+  $entry = ['carton_qty' => 0];
+
+  if (!empty($ident['sku_id'])) {
+    $entry['sku_id'] = (int)$ident['sku_id'];
+  } else {
+    $entry['sku'] = $ident['sku'];
+  }
+
+  $payload = [
+    'warehouse_id' => VO_WAREHOUSE_ID,
+    'sku_qty_list' => [$entry]
+  ];
+
+  if (!empty($ident['organization_id'])) {
+    $payload['organization_id'] = (int)$ident['organization_id'];
+  }
+
+  return voPostAndCheck('/api/update_plain_carton_line_item_qty/', $payload);
+}
+
+function voSetLooseToTotal(array $ident, $total) {
+  $entry = [
+    'pcs_in_loose_stock' => (int)$total
+  ];
+
+  if (!empty($ident['sku_id'])) {
+    $entry['sku_id'] = (int)$ident['sku_id'];
+  } else {
+    $entry['sku'] = $ident['sku'];
+  }
+
+  $payload = [
+    'warehouse_id' => VO_WAREHOUSE_ID,
+    'sku_qty_list' => [$entry]
+  ];
+
+  if (!empty($ident['organization_id'])) {
+    $payload['organization_id'] = (int)$ident['organization_id'];
+  }
+
+  return voPostAndCheck('/api/update_loose_stock/', $payload);
+}
+
+function voVerifyLooseEquals($skuBase, $expect) {
+  $note = null;
+  $row = voFetchStockEntry($skuBase, $note);
+  if (!$row) {
+    return [false, $note];
+  }
+
+  [$metric, $fieldUsed] = voExtractMetricDetails($row);
+  if ($metric === null) {
+    $debugKeys = implode(',', array_keys($row));
+    logMsg("ℹ️ VO metric scan failed for $skuBase | keys=$debugKeys");
+    return [false, 'stock-metric-missing'];
+  }
+
+  $parts = [];
+  $parts[] = $fieldUsed . '=' . $metric;
+  if (isset($row['_matched_candidate']) && strcasecmp($row['_matched_candidate'], $skuBase) !== 0) {
+    $parts[] = '(matched ' . $row['_matched_candidate'] . ')';
+  }
+  if (!empty($row['_warehouse_ids'])) {
+    $parts[] = 'warehouses=' . implode(',', $row['_warehouse_ids']);
+  }
+
+  return [$metric === (int)$expect, implode(' ', $parts)];
 }
 
 function updateVentoryTotal($csvSku, $total) {
   $skuBase = normalizeVoSku($csvSku);
 
-  $okC = voSetCartonsZero($skuBase);
-  $okL = voSetLooseToTotal($skuBase, $total);
+  $lookupNote = null;
+  $lookupRow = voFetchStockEntry($skuBase, $lookupNote);
+  $ident = [
+    'sku' => $skuBase,
+    'sku_id' => $lookupRow ? voExtractSkuId($lookupRow) : null,
+    'organization_id' => $lookupRow ? voExtractOrganizationId($lookupRow) : null,
+  ];
+
+  if (!$lookupRow && $lookupNote) {
+    logMsg("ℹ️ VO lookup $skuBase before update: $lookupNote");
+  }
+
+  [$okC, $cartonNote] = voSetCartonsZero($ident);
+  if (!$okC) {
+    logMsg("⚠️ VO carton reset $skuBase failed: $cartonNote");
+  }
+
+  [$okL, $looseNote] = voSetLooseToTotal($ident, $total);
+  if (!$okL) {
+    logMsg("⚠️ VO loose set $skuBase failed: $looseNote");
+  }
 
   if ($okC && $okL) {
     // verify (after async processing it may take a moment; still try once)
