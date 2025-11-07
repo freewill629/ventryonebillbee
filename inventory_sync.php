@@ -502,6 +502,8 @@ function voFetchStockEntry($skuBase, &$note = null) {
       $rows = $json;
       if (isset($json['results']) && is_array($json['results'])) {
         $rows = $json['results'];
+      } elseif (isset($json['data']) && is_array($json['data'])) {
+        $rows = $json['data'];
       }
 
       if (!is_array($rows)) {
@@ -594,7 +596,9 @@ function voFetchStockEntry($skuBase, &$note = null) {
 }
 
 function voExtractSkuId(array $row) {
-  foreach (['sku_id', 'skuId', 'id'] as $field) {
+  foreach ([
+    'sku_id', 'skuId', 'id', 'obj_id', 'objId', 'sku_obj_id', 'skuObjId'
+  ] as $field) {
     if (!array_key_exists($field, $row)) continue;
     $value = extractIntFromMixed($row[$field]);
     if ($value !== null) return $value;
@@ -642,6 +646,43 @@ function voExtractOrganizationId(array $row) {
   }
 
   return null;
+}
+
+function voResolveSkuForUpdate(?array $row = null, $skuBase = '', $csvSku = '') {
+  $candidates = [];
+
+  if (is_array($row)) {
+    foreach ([
+      '_matched_candidate', 'sku', 'sku_code', 'skuCode', 'sku_name', 'skuName',
+      'sku_display_name', 'skuDisplayName', 'sku_full_name', 'skuFullName',
+      'sku_value', 'skuValue', 'variation_name', 'variationName', 'name'
+    ] as $field) {
+      if (!array_key_exists($field, $row)) continue;
+      $value = $row[$field];
+      if (is_string($value)) {
+        $trimmed = trim($value);
+        if ($trimmed !== '') {
+          $candidates[] = $trimmed;
+        }
+      }
+    }
+  }
+
+  if (is_string($skuBase) && $skuBase !== '') {
+    $candidates[] = $skuBase;
+  }
+
+  if (is_string($csvSku) && $csvSku !== '' && $csvSku !== $skuBase) {
+    $candidates[] = $csvSku;
+  }
+
+  foreach ($candidates as $candidate) {
+    if ($candidate !== '') {
+      return $candidate;
+    }
+  }
+
+  return $skuBase ?: $csvSku;
 }
 
 function voPostAndCheck($path, array $payload) {
@@ -766,8 +807,9 @@ function updateVentoryTotal($csvSku, $total) {
 
   $lookupNote = null;
   $lookupRow = voFetchStockEntry($skuBase, $lookupNote);
+  $preferredSku = voResolveSkuForUpdate($lookupRow ?? null, $skuBase, $csvSku);
   $ident = [
-    'sku' => $skuBase,
+    'sku' => $preferredSku,
     'sku_id' => $lookupRow ? voExtractSkuId($lookupRow) : null,
     'organization_id' => $lookupRow ? voExtractOrganizationId($lookupRow) : null,
   ];
