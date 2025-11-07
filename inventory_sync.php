@@ -1,0 +1,292 @@
+<?php
+/**
+ * Inventory Sync (LIVE)
+ * - VentoryOne: set STK – Insgesamt to CSV total (cartons=0, loose=CSV)
+ * - Billbee: apply safety deduction before update
+ *
+ * Run: php inventory_sync.php
+ */
+
+if (php_sapi_name() !== 'cli') die('Access denied.');
+date_default_timezone_set('Europe/Berlin');
+error_reporting(E_ALL);
+ini_set('display_errors', 0);
+
+/* ================= CONFIG ================= */
+define('FTP_HOST', '80.151.37.192');
+define('FTP_PORT', 45801);
+define('FTP_USER', 'feela');
+define('FTP_PASS', '14022023#');
+define('FTP_DIR',  'bestand'); // CSV directory on FTP
+
+// CSV headers (from stock_quantity.csv)
+define('CSV_SKU_COL', 'Variant SKU');
+define('CSV_QTY_COL', 'Inventory Available: Cafol DE');
+
+define('LOCAL_CSV_DIR', __DIR__ . '/csv_files');
+define('LOG_FILE', __DIR__ . '/sync_' . date('Ymd_His') . '.log');
+
+// VentoryOne (2116 = cafol warehouse)
+define('VO_BASE', 'https://app.ventory.one');
+define('VO_TOKEN', '2d94eb4a8c3c2cef8ad628e3619591069b7156ed');
+define('VO_WAREHOUSE_ID', 2116);
+
+// Billbee
+define('BILLBEE_API_URL', 'https://app.billbee.io/api/v1/');
+define('BILLBEE_USER', 'info@feela.de');
+define('BILLBEE_API_PASSWORD', 'LuPWibuTa7Ngn8m');
+define('BILLBEE_API_KEY', '2FAA5DE0-18EA-4C4E-88EB-F0394109CF2E');
+
+// Retry & timeouts
+define('MAX_RETRIES', 3);
+define('RETRY_BASE_MS', 600);
+define('CONNECT_TIMEOUT', 15);
+define('REQUEST_TIMEOUT', 45);
+
+/* ================ LOGGING ================= */
+function logMsg($msg) {
+  $line = '[' . date('Y-m-d H:i:s') . '] ' . $msg . PHP_EOL;
+  echo $line;
+  file_put_contents(LOG_FILE, $line, FILE_APPEND);
+}
+
+/* ============== HTTP with retry ============== */
+function httpJsonWithRetry($url, $method, $headers, $jsonBody) {
+  $body = $jsonBody === null ? null : json_encode($jsonBody, JSON_UNESCAPED_SLASHES);
+  $last = [0, null, null, ''];
+  for ($a=1; $a<=MAX_RETRIES; $a++) {
+    $ch = curl_init($url);
+    $verbose = fopen('php://temp', 'w+');
+    curl_setopt_array($ch, [
+      CURLOPT_RETURNTRANSFER => true,
+      CURLOPT_CUSTOMREQUEST  => $method,
+      CURLOPT_HTTPHEADER     => array_merge($headers, ['User-Agent: FeelaSync/1.0']),
+      CURLOPT_CONNECTTIMEOUT => CONNECT_TIMEOUT,
+      CURLOPT_TIMEOUT        => REQUEST_TIMEOUT,
+      CURLOPT_POSTFIELDS     => $body,
+      CURLOPT_SSL_VERIFYPEER => true,
+      CURLOPT_SSL_VERIFYHOST => 2,
+      CURLOPT_VERBOSE        => true,
+      CURLOPT_STDERR         => $verbose,
+    ]);
+    $resp = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
+    rewind($verbose);
+    $vout = stream_get_contents($verbose);
+    fclose($verbose);
+
+    $last = [$code, $resp, $err, $vout];
+
+    if ($code >= 200 && $code < 300) return $last;
+    if ($code == 429 || ($code >= 500 && $code <= 599) || $code == 0) {
+      usleep((int)((RETRY_BASE_MS * (2 ** ($a-1))) * 1000));
+      continue;
+    }
+    break; // non-retryable
+  }
+  return $last;
+}
+
+/* ================ FTP ===================== */
+function downloadLatestCSV() {
+  if (!is_dir(LOCAL_CSV_DIR)) mkdir(LOCAL_CSV_DIR, 0777, true);
+
+  $conn = ftp_connect(FTP_HOST, FTP_PORT);
+  if (!$conn) { logMsg("❌ FTP connect failed"); exit(1); }
+  if (!ftp_login($conn, FTP_USER, FTP_PASS)) { logMsg("❌ FTP login failed"); exit(1); }
+  ftp_pasv($conn, true);
+  if (!ftp_chdir($conn, FTP_DIR)) { logMsg("❌ FTP chdir failed: " . FTP_DIR); exit(1); }
+
+  $files = ftp_nlist($conn, ".");
+  if (!$files) { logMsg("❌ No files in FTP dir"); exit(1); }
+  $csvs = array_filter($files, fn($f) => preg_match('/\.csv$/i', $f));
+  if (!$csvs) { logMsg("❌ No CSV files found"); exit(1); }
+  sort($csvs, SORT_NATURAL);
+  $latest = end($csvs);
+
+  $local  = LOCAL_CSV_DIR . '/' . basename($latest);
+  if (!ftp_get($conn, $local, $latest, FTP_BINARY)) { logMsg("❌ FTP download failed: $latest"); exit(1); }
+  ftp_close($conn);
+
+  logMsg("✅ Downloaded: $latest → $local");
+  return $local;
+}
+
+/* ================ CSV PARSER ============== */
+function detectDelimiter($line) {
+  $c = [';', ',', "\t", '|']; $best=';'; $cnt=0;
+  foreach ($c as $d) { $n=substr_count($line,$d); if ($n>$cnt){$cnt=$n;$best=$d;} }
+  return $best;
+}
+function parseCSV($path) {
+  $raw = file_get_contents($path);
+  if ($raw === false) { logMsg("❌ Cannot read CSV"); exit(1); }
+  $raw = preg_replace('/^\xEF\xBB\xBF/','',$raw);
+  $raw = str_replace(["\r\n","\r"],"\n",$raw);
+  $lines = explode("\n", trim($raw));
+  if (count($lines) < 2) { logMsg("❌ CSV seems empty"); exit(1); }
+
+  $delim  = detectDelimiter($lines[0]);
+  $header = str_getcsv($lines[0], $delim);
+
+  $rows = [];
+  for ($i=1; $i<count($lines); $i++) {
+    $line = trim($lines[$i]);
+    if ($line==='') continue;
+    $data = str_getcsv($line, $delim);
+    if (!$data) continue;
+    $row = array_combine($header, array_pad($data, count($header), null));
+    $sku = trim($row[CSV_SKU_COL] ?? '');
+    $qty = trim($row[CSV_QTY_COL] ?? '');
+    $qty = (int)round((float)str_replace(',', '.', $qty));
+    if ($sku !== '' && $qty >= 0) $rows[] = ['sku'=>$sku, 'stock'=>$qty];
+  }
+
+  logMsg("🔍 Parsed " . count($rows) . " SKUs from stock file");
+  foreach (array_slice($rows, 0, 5) as $p) logMsg("   Sample → SKU: {$p['sku']} | Stock: {$p['stock']}");
+  return $rows;
+}
+
+/* ===== SAFETY BUFFER for Billbee ===== */
+function adjustStockForBillbee($stock) {
+  // Simple tiered safety stock:
+  if ($stock > 50) return max(0, $stock - 20);  // fast
+  if ($stock > 20) return max(0, $stock - 10);  // medium
+  if ($stock > 5)  return max(0, $stock - 3);   // slow
+  return max(0, $stock - 1);                    // very low
+}
+
+/* ============ Helpers ============ */
+function normalizeVoSku($sku) {
+  // VentoryOne uses the base SKU (no "-FBM")
+  return preg_replace('/-FBM$/', '', $sku);
+}
+
+/* ============ VentoryOne ============ */
+function voSetCartonsZero($skuBase) {
+  $url = VO_BASE . '/api/update_plain_carton_line_item_qty/';
+  $headers = [
+    'Authorization: Bearer ' . VO_TOKEN,
+    'Content-Type: application/json',
+    'Accept: application/json'
+  ];
+  $payload = [
+    'warehouse_id' => VO_WAREHOUSE_ID,
+    'sku_qty_list' => [[
+      'sku'        => $skuBase,
+      'carton_qty' => 0
+    ]]
+  ];
+  [$code, $resp] = httpJsonWithRetry($url, 'POST', $headers, $payload);
+  return $code >= 200 && $code < 300;
+}
+
+function voSetLooseToTotal($skuBase, $total) {
+  $url = VO_BASE . '/api/update_loose_stock/';
+  $headers = [
+    'Authorization: Bearer ' . VO_TOKEN,
+    'Content-Type: application/json',
+    'Accept: application/json'
+  ];
+  $payload = [
+    'warehouse_id' => VO_WAREHOUSE_ID,
+    'sku_qty_list' => [[
+      'sku'               => $skuBase,
+      'pcs_in_loose_stock'=> (int)$total
+    ]]
+  ];
+  [$code, $resp] = httpJsonWithRetry($url, 'POST', $headers, $payload);
+  return $code >= 200 && $code < 300;
+}
+
+function voVerifyLooseEquals($skuBase, $expect) {
+  $url = VO_BASE . '/api/current_stock/All/';
+  $headers = [
+    'Authorization: Bearer ' . VO_TOKEN,
+    'Accept: application/json'
+  ];
+  [$code, $resp] = httpJsonWithRetry($url, 'GET', $headers, null);
+  if (!($code >= 200 && $code < 300) || !$resp) return [false, 'HTTP '.$code];
+  $json = json_decode($resp, true);
+  if (!is_array($json)) return [false, 'Bad JSON'];
+  foreach ($json as $row) {
+    if (($row['sku'] ?? '') === $skuBase && (int)($row['warehouse_id'] ?? 0) === VO_WAREHOUSE_ID) {
+      $loose = (int)($row['qty_loose_stock'] ?? -1);
+      return [$loose === (int)$expect, 'loose='.$loose];
+    }
+  }
+  return [false, 'SKU not found in current_stock'];
+}
+
+function updateVentoryTotal($csvSku, $total) {
+  $skuBase = normalizeVoSku($csvSku);
+
+  $okC = voSetCartonsZero($skuBase);
+  $okL = voSetLooseToTotal($skuBase, $total);
+
+  if ($okC && $okL) {
+    // verify (after async processing it may take a moment; still try once)
+    [$okV, $note] = voVerifyLooseEquals($skuBase, $total);
+    if ($okV) {
+      logMsg("✅ VO OK $skuBase → STK–Insgesamt=$total (cartons=0, loose=$total)");
+    } else {
+      logMsg("✅ VO submitted $skuBase total=$total (verify pending: $note)");
+    }
+    return true;
+  }
+
+  logMsg("❌ VO FAIL $skuBase → total=$total (cartonsZero=" . ($okC?'OK':'FAIL') . ", looseSet=" . ($okL?'OK':'FAIL') . ")");
+  return false;
+}
+
+/* ============== Billbee ============== */
+function updateBillbee($sku, $qty) {
+  $url = BILLBEE_API_URL . 'products/updatestock';
+  $auth = base64_encode(BILLBEE_USER . ':' . BILLBEE_API_PASSWORD);
+  $headers = [
+    'Authorization: Basic ' . $auth,
+    'X-Billbee-Api-Key: ' . BILLBEE_API_KEY,
+    'Content-Type: application/json',
+    'Accept: application/json'
+  ];
+  $payload = [
+    'Sku'         => $sku,
+    'NewQuantity' => (int)$qty,
+    'Reason'      => 'Automated sync via Feela'
+  ];
+  [$code, $resp] = httpJsonWithRetry($url, 'POST', $headers, $payload);
+
+  if ($code >= 200 && $code < 300) {
+    logMsg("✅ Billbee OK $sku → $qty");
+    return true;
+  }
+  $preview = $resp ? substr($resp, 0, 240) : 'no-body';
+  logMsg("❌ Billbee FAIL $sku HTTP $code | Resp: $preview");
+  return false;
+}
+
+/* ================= MAIN =================== */
+logMsg("========== INVENTORY SYNC (LIVE) ==========");
+$csv  = downloadLatestCSV();
+$rows = parseCSV($csv);
+
+$count = count($rows);
+logMsg("📦 Found $count SKUs in stock file");
+
+$okVO = 0; $failVO = 0; $okBB = 0; $failBB = 0;
+
+foreach ($rows as $r) {
+  $csvSku = $r['sku'];
+  $stock  = (int)$r['stock'];
+
+  // --- VentoryOne: STK – Insgesamt = CSV total (cartons=0, loose=stock) ---
+  if (updateVentoryTotal($csvSku, $stock)) $okVO++; else $failVO++;
+
+  // --- Billbee: safety stock logic ---
+  $bbQty = adjustStockForBillbee($stock);
+  updateBillbee($csvSku, $bbQty) ? $okBB++ : $failBB++;
+}
+
+logMsg("✅ Done. VO OK: $okVO/$count | VO Fail: $failVO/$count | Billbee OK: $okBB/$count | Billbee Fail: $failBB/$count");
