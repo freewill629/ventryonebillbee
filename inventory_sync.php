@@ -25,6 +25,7 @@ define('CSV_QTY_COL', 'Inventory Available: Cafol DE');
 
 define('LOCAL_CSV_DIR', __DIR__ . '/csv_files');
 define('LOG_FILE', __DIR__ . '/sync_' . date('Ymd_His') . '.log');
+define('LOG_ECHO_ENABLED', false); // disable stdout noise to avoid cron email spam
 
 // VentoryOne (2116 = cafol warehouse)
 define('VO_BASE', 'https://app.ventory.one');
@@ -46,7 +47,9 @@ define('REQUEST_TIMEOUT', 45);
 /* ================ LOGGING ================= */
 function logMsg($msg) {
   $line = '[' . date('Y-m-d H:i:s') . '] ' . $msg . PHP_EOL;
-  echo $line;
+  if (LOG_ECHO_ENABLED) {
+    echo $line;
+  }
   file_put_contents(LOG_FILE, $line, FILE_APPEND);
 }
 
