@@ -164,6 +164,97 @@ function normalizeVoSku($sku) {
   return preg_replace('/-FBM$/', '', $sku);
 }
 
+function collectStrings($value, array &$out) {
+  if (is_string($value)) {
+    $trimmed = trim($value);
+    if ($trimmed !== '') $out[] = $trimmed;
+    return;
+  }
+
+  if (is_array($value)) {
+    foreach ($value as $item) collectStrings($item, $out);
+    return;
+  }
+
+  if (is_object($value)) {
+    foreach (get_object_vars($value) as $item) collectStrings($item, $out);
+  }
+}
+
+function collectWarehouseIds($value, array &$out) {
+  if ($value === null) return;
+
+  if (is_int($value)) {
+    $out[] = $value;
+    return;
+  }
+
+  if (is_string($value) && preg_match('/^-?\d+$/', trim($value))) {
+    $out[] = (int)trim($value);
+    return;
+  }
+
+  if (is_float($value)) {
+    $out[] = (int)$value;
+    return;
+  }
+
+  if (is_array($value)) {
+    foreach ($value as $key => $item) {
+      if (is_string($key)) {
+        $lower = strtolower($key);
+        if (strpos($lower, 'warehouse') !== false || strpos($lower, 'id') !== false) {
+          collectWarehouseIds($item, $out);
+        }
+      } else {
+        collectWarehouseIds($item, $out);
+      }
+    }
+    return;
+  }
+
+  if (is_object($value)) {
+    collectWarehouseIds(get_object_vars($value), $out);
+  }
+}
+
+function extractSkuCandidates(array $row) {
+  $preferredKeys = [
+    'sku', 'sku_code', 'skuCode', 'sku_name', 'skuName', 'sku_full_name',
+    'skuFullName', 'sku_display_name', 'skuDisplayName', 'name', 'skuValue',
+    'sku_value', 'sku_number', 'skuNumber'
+  ];
+
+  $candidates = [];
+
+  foreach ($preferredKeys as $key) {
+    if (!array_key_exists($key, $row)) continue;
+    collectStrings($row[$key], $candidates);
+  }
+
+  if (!$candidates) {
+    // Fallback: scan nested structures for matching strings.
+    collectStrings($row, $candidates);
+  }
+
+  $candidates = array_values(array_unique(array_filter($candidates, fn($s) => $s !== '')));
+
+  return $candidates;
+}
+
+function extractWarehouseIds(array $row) {
+  $ids = [];
+
+  foreach (['warehouse_id', 'warehouse', 'warehouse_info'] as $key) {
+    if (!array_key_exists($key, $row)) continue;
+    collectWarehouseIds($row[$key], $ids);
+  }
+
+  $ids = array_values(array_unique(array_map('intval', $ids)));
+
+  return $ids;
+}
+
 /* ============ VentoryOne ============ */
 function voSetCartonsZero($skuBase) {
   $url = VO_BASE . '/api/update_plain_carton_line_item_qty/';
@@ -238,43 +329,51 @@ function voVerifyLooseEquals($skuBase, $expect) {
       foreach ($rows as $row) {
         if (!is_array($row)) continue;
 
-        $skuCandidate = (string)($row['sku'] ?? $row['sku_code'] ?? $row['skuName'] ?? '');
-
-        $warehouseRaw = $row['warehouse_id'] ?? $row['warehouse'] ?? null;
-        $warehouseId = null;
-        if (is_array($warehouseRaw)) {
-          $warehouseId = (int)($warehouseRaw['id'] ?? $warehouseRaw['pk'] ?? 0);
-        } elseif (is_object($warehouseRaw)) {
-          $warehouseId = (int)($warehouseRaw->id ?? $warehouseRaw->pk ?? 0);
-        } elseif ($warehouseRaw !== null) {
-          $warehouseId = (int)$warehouseRaw;
+        $skuDisplay = null;
+        $skuMatches = false;
+        foreach (extractSkuCandidates($row) as $candidate) {
+          if (strcasecmp($candidate, $skuBase) === 0 || strcasecmp(normalizeVoSku($candidate), $skuBase) === 0) {
+            $skuDisplay = $candidate;
+            $skuMatches = true;
+            break;
+          }
         }
 
-        if (strcasecmp($skuCandidate, $skuBase) === 0 && ($warehouseId === null || $warehouseId === VO_WAREHOUSE_ID)) {
-          $metric = null;
-          $fieldUsed = null;
-          foreach ([
-            'stk_insgesamt',
-            'qty_total_stock',
-            'total_qty',
-            'total_stock',
-            'qty_loose_stock',
-            'loose_qty',
-            'qty'
-          ] as $field) {
-            if (array_key_exists($field, $row)) {
-              $metric = (int)$row[$field];
-              $fieldUsed = $field;
-              break;
-            }
-          }
+        if (!$skuMatches) continue;
 
-          if ($metric === null) {
-            return [false, 'stock-metric-missing'];
-          }
-
-          return [$metric === (int)$expect, $fieldUsed . '=' . $metric];
+        $warehouseIds = extractWarehouseIds($row);
+        if ($warehouseIds && !in_array(VO_WAREHOUSE_ID, $warehouseIds, true)) {
+          continue;
         }
+
+        $metric = null;
+        $fieldUsed = null;
+        foreach ([
+          'stk_insgesamt',
+          'qty_total_stock',
+          'total_qty',
+          'total_stock',
+          'qty_loose_stock',
+          'loose_qty',
+          'qty'
+        ] as $field) {
+          if (array_key_exists($field, $row)) {
+            $metric = (int)$row[$field];
+            $fieldUsed = $field;
+            break;
+          }
+        }
+
+        if ($metric === null) {
+          return [false, 'stock-metric-missing'];
+        }
+
+        $note = $fieldUsed . '=' . $metric;
+        if ($skuDisplay !== null && strcasecmp($skuDisplay, $skuBase) !== 0) {
+          $note .= ' (matched ' . $skuDisplay . ')';
+        }
+
+        return [$metric === (int)$expect, $note];
       }
 
       $next = $json['next'] ?? null;
