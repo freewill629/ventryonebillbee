@@ -12,6 +12,27 @@ date_default_timezone_set('Europe/Berlin');
 error_reporting(E_ALL);
 ini_set('display_errors', 0);
 
+// Determine whether log output should also be echoed to STDOUT.
+$argv = $argv ?? [];
+$forceEcho  = false;
+$forceQuiet = false;
+foreach (array_slice($argv, 1) as $arg) {
+  if ($arg === '--verbose' || $arg === '-v') {
+    $forceEcho = true;
+  } elseif ($arg === '--quiet' || $arg === '-q') {
+    $forceQuiet = true;
+  }
+}
+
+$defaultEcho = false;
+if (getenv('INVENTORY_SYNC_STDOUT') === '1') {
+  $defaultEcho = true;
+} elseif (function_exists('posix_isatty') && defined('STDOUT')) {
+  $defaultEcho = @posix_isatty(STDOUT);
+}
+
+$logEchoEnabled = $forceQuiet ? false : ($forceEcho ? true : $defaultEcho);
+
 /* ================= CONFIG ================= */
 define('FTP_HOST', '80.151.37.192');
 define('FTP_PORT', 45801);
@@ -25,7 +46,7 @@ define('CSV_QTY_COL', 'Inventory Available: Cafol DE');
 
 define('LOCAL_CSV_DIR', __DIR__ . '/csv_files');
 define('LOG_FILE', __DIR__ . '/sync_' . date('Ymd_His') . '.log');
-define('LOG_ECHO_ENABLED', false); // disable stdout noise to avoid cron email spam
+define('LOG_ECHO_ENABLED', $logEchoEnabled);
 
 // VentoryOne (2116 = cafol warehouse)
 define('VO_BASE', 'https://app.ventory.one');
