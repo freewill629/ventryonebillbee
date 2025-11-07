@@ -531,34 +531,44 @@ function voFetchStockEntry($skuBase, &$note = null) {
           continue;
         }
 
-        [$metric, $fieldUsed] = voExtractMetricDetails($row);
+        $metric = null;
+        $fieldUsed = null;
+        foreach ([
+          'stk_insgesamt',
+          'qty_total_stock',
+          'total_qty',
+          'total_stock',
+          'qty_loose_stock',
+          'loose_qty',
+          'qty'
+        ] as $field) {
+          if (!array_key_exists($field, $row)) continue;
+          $value = normalizeIntValue($row[$field]);
+          if ($value === null) continue;
+          $metric = $value;
+          $fieldUsed = $field;
+          break;
+        }
 
-        $enrichedRow = $row;
+        if ($metric === null) {
+          $note = 'stock-metric-missing';
+          continue;
+        }
+
+        $note = $fieldUsed . '=' . $metric;
         if ($skuDisplay !== null && strcasecmp($skuDisplay, $skuBase) !== 0) {
-          $enrichedRow['_matched_candidate'] = $skuDisplay;
+          $note .= ' (matched ' . $skuDisplay . ')';
+          $row['_matched_candidate'] = $skuDisplay;
         }
 
         if ($warehouseIds) {
-          $enrichedRow['_warehouse_ids'] = $warehouseIds;
+          $row['_warehouse_ids'] = $warehouseIds;
         }
 
-        if ($metric !== null) {
-          $enrichedRow['_metric_field'] = $fieldUsed;
-          $enrichedRow['_metric_value'] = $metric;
+        $row['_metric_field'] = $fieldUsed;
+        $row['_metric_value'] = $metric;
 
-          $note = ($fieldUsed ? $fieldUsed : 'metric') . '=' . $metric;
-          if (isset($enrichedRow['_matched_candidate'])) {
-            $note .= ' (matched ' . $enrichedRow['_matched_candidate'] . ')';
-          }
-
-          return $enrichedRow;
-        }
-
-        if ($fallbackRow === null) {
-          $fallbackRow = $enrichedRow;
-        }
-
-        $note = 'stock-metric-missing';
+        return $row;
       }
 
       $next = $json['next'] ?? null;
