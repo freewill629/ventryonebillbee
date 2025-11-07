@@ -202,22 +202,99 @@ function voSetLooseToTotal($skuBase, $total) {
 }
 
 function voVerifyLooseEquals($skuBase, $expect) {
-  $url = VO_BASE . '/api/current_stock/All/';
   $headers = [
     'Authorization: Bearer ' . VO_TOKEN,
     'Accept: application/json'
   ];
-  [$code, $resp] = httpJsonWithRetry($url, 'GET', $headers, null);
-  if (!($code >= 200 && $code < 300) || !$resp) return [false, 'HTTP '.$code];
-  $json = json_decode($resp, true);
-  if (!is_array($json)) return [false, 'Bad JSON'];
-  foreach ($json as $row) {
-    if (($row['sku'] ?? '') === $skuBase && (int)($row['warehouse_id'] ?? 0) === VO_WAREHOUSE_ID) {
-      $loose = (int)($row['qty_loose_stock'] ?? -1);
-      return [$loose === (int)$expect, 'loose='.$loose];
+
+  $attempts = [
+    VO_BASE . '/api/current_stock/All/?search=' . urlencode($skuBase),
+    VO_BASE . '/api/current_stock/All/'
+  ];
+
+  $lastNote = 'SKU not found in current_stock';
+
+  foreach ($attempts as $baseUrl) {
+    if (!$baseUrl) continue;
+    $url = $baseUrl;
+    while ($url) {
+      [$code, $resp] = httpJsonWithRetry($url, 'GET', $headers, null);
+      if (!($code >= 200 && $code < 300) || !$resp) {
+        $lastNote = 'HTTP ' . $code;
+        break;
+      }
+
+      $json = json_decode($resp, true);
+      if (!is_array($json)) {
+        $lastNote = 'Bad JSON';
+        break;
+      }
+
+      $rows = $json;
+      if (isset($json['results']) && is_array($json['results'])) {
+        $rows = $json['results'];
+      }
+
+      foreach ($rows as $row) {
+        if (!is_array($row)) continue;
+
+        $skuCandidate = (string)($row['sku'] ?? $row['sku_code'] ?? $row['skuName'] ?? '');
+
+        $warehouseRaw = $row['warehouse_id'] ?? $row['warehouse'] ?? null;
+        $warehouseId = null;
+        if (is_array($warehouseRaw)) {
+          $warehouseId = (int)($warehouseRaw['id'] ?? $warehouseRaw['pk'] ?? 0);
+        } elseif (is_object($warehouseRaw)) {
+          $warehouseId = (int)($warehouseRaw->id ?? $warehouseRaw->pk ?? 0);
+        } elseif ($warehouseRaw !== null) {
+          $warehouseId = (int)$warehouseRaw;
+        }
+
+        if (strcasecmp($skuCandidate, $skuBase) === 0 && ($warehouseId === null || $warehouseId === VO_WAREHOUSE_ID)) {
+          $metric = null;
+          $fieldUsed = null;
+          foreach ([
+            'stk_insgesamt',
+            'qty_total_stock',
+            'total_qty',
+            'total_stock',
+            'qty_loose_stock',
+            'loose_qty',
+            'qty'
+          ] as $field) {
+            if (array_key_exists($field, $row)) {
+              $metric = (int)$row[$field];
+              $fieldUsed = $field;
+              break;
+            }
+          }
+
+          if ($metric === null) {
+            return [false, 'stock-metric-missing'];
+          }
+
+          return [$metric === (int)$expect, $fieldUsed . '=' . $metric];
+        }
+      }
+
+      $next = $json['next'] ?? null;
+      if (!$next) {
+        break;
+      }
+
+      if (is_string($next)) {
+        if (preg_match('#^https?://#', $next)) {
+          $url = $next;
+        } else {
+          $url = rtrim(VO_BASE, '/') . '/' . ltrim($next, '/');
+        }
+      } else {
+        $url = null;
+      }
     }
   }
-  return [false, 'SKU not found in current_stock'];
+
+  return [false, $lastNote];
 }
 
 function updateVentoryTotal($csvSku, $total) {
