@@ -221,114 +221,24 @@ function collectWarehouseIds($value, array &$out) {
   }
 }
 
-function extractSkuCandidates(array $row) {
-  $preferredKeys = [
-    'sku', 'sku_code', 'skuCode', 'sku_name', 'skuName', 'sku_full_name',
-    'skuFullName', 'sku_display_name', 'skuDisplayName', 'name', 'skuValue',
-    'sku_value', 'sku_number', 'skuNumber'
-  ];
-
-  $candidates = [];
-
-  foreach ($preferredKeys as $key) {
-    if (!array_key_exists($key, $row)) continue;
-    collectStrings($row[$key], $candidates);
-  }
-
-  if (!$candidates) {
-    // Fallback: scan nested structures for matching strings.
-    collectStrings($row, $candidates);
-  }
-
-  $candidates = array_values(array_unique(array_filter($candidates, fn($s) => $s !== '')));
-
-  return $candidates;
-}
-
-function extractWarehouseIds(array $row) {
-  $ids = [];
-
-  foreach (['warehouse_id', 'warehouse', 'warehouse_info'] as $key) {
-    if (!array_key_exists($key, $row)) continue;
-    collectWarehouseIds($row[$key], $ids);
-  }
-
-  $ids = array_values(array_unique(array_map('intval', $ids)));
-
-  return $ids;
-}
-
-/* ============ VentoryOne ============ */
-function voSetCartonsZero($skuBase) {
-  $url = VO_BASE . '/api/update_plain_carton_line_item_qty/';
-  $headers = [
-    'Authorization: Bearer ' . VO_TOKEN,
-    'Content-Type: application/json',
-    'Accept: application/json'
-  ];
-  $payload = [
-    'warehouse_id' => VO_WAREHOUSE_ID,
-    'sku_qty_list' => [[
-      'sku'        => $skuBase,
-      'carton_qty' => 0
-    ]]
-  ];
-  [$code, $resp] = httpJsonWithRetry($url, 'POST', $headers, $payload);
-  return $code >= 200 && $code < 300;
-}
-
-function collectStrings($value, array &$out) {
-  if (is_string($value)) {
-    $trimmed = trim($value);
-    if ($trimmed !== '') $out[] = $trimmed;
-    return;
-  }
-
-  if (is_array($value)) {
-    foreach ($value as $item) collectStrings($item, $out);
-    return;
-  }
-
-  if (is_object($value)) {
-    foreach (get_object_vars($value) as $item) collectStrings($item, $out);
-  }
-}
-
-function collectWarehouseIds($value, array &$out) {
-  if ($value === null) return;
-
+function extractIntFromMixed($value) {
   if (is_int($value)) {
-    $out[] = $value;
-    return;
-  }
-
-  if (is_string($value) && preg_match('/^-?\d+$/', trim($value))) {
-    $out[] = (int)trim($value);
-    return;
+    return $value;
   }
 
   if (is_float($value)) {
-    $out[] = (int)$value;
-    return;
+    return (int)round($value);
   }
 
-  if (is_array($value)) {
-    foreach ($value as $key => $item) {
-      if (is_string($key)) {
-        $lower = strtolower($key);
-        if (strpos($lower, 'warehouse') !== false || strpos($lower, 'id') !== false) {
-          collectWarehouseIds($item, $out);
-        }
-      } else {
-        collectWarehouseIds($item, $out);
-      }
-    }
-    return;
+  if (is_string($value)) {
+    $trimmed = trim($value);
+    if ($trimmed === '') return null;
+    if (!preg_match('/^-?\d+(?:[\.,]\d+)?$/', $trimmed)) return null;
+    $normalized = str_replace(',', '.', $trimmed);
+    return (int)round((float)$normalized);
   }
 
-  if (is_object($value)) {
-    collectWarehouseIds(get_object_vars($value), $out);
-  }
+  return null;
 }
 
 function extractSkuCandidates(array $row) {
@@ -608,23 +518,33 @@ function voFetchStockEntry($skuBase, &$note = null) {
           'loose_qty',
           'qty'
         ] as $field) {
-          if (array_key_exists($field, $row)) {
-            $metric = (int)$row[$field];
-            $fieldUsed = $field;
-            break;
-          }
+          if (!array_key_exists($field, $row)) continue;
+          $value = normalizeIntValue($row[$field]);
+          if ($value === null) continue;
+          $metric = $value;
+          $fieldUsed = $field;
+          break;
         }
 
         if ($metric === null) {
-          return [false, 'stock-metric-missing'];
+          $note = 'stock-metric-missing';
+          continue;
         }
 
         $note = $fieldUsed . '=' . $metric;
         if ($skuDisplay !== null && strcasecmp($skuDisplay, $skuBase) !== 0) {
           $note .= ' (matched ' . $skuDisplay . ')';
+          $row['_matched_candidate'] = $skuDisplay;
         }
 
-        return [$metric === (int)$expect, $note];
+        if ($warehouseIds) {
+          $row['_warehouse_ids'] = $warehouseIds;
+        }
+
+        $row['_metric_field'] = $fieldUsed;
+        $row['_metric_value'] = $metric;
+
+        return $row;
       }
 
       $next = $json['next'] ?? null;
