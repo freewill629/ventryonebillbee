@@ -48,10 +48,10 @@ define('LOCAL_CSV_DIR', __DIR__ . '/csv_files');
 define('LOG_FILE', __DIR__ . '/sync_' . date('Ymd_His') . '.log');
 define('LOG_ECHO_ENABLED', $logEchoEnabled);
 
-// VentoryOne (2116 = cafol warehouse)
+// VentoryOne (2285 = cafol warehouse)
 define('VO_BASE', 'https://app.ventory.one');
 define('VO_TOKEN', '2d94eb4a8c3c2cef8ad628e3619591069b7156ed');
-define('VO_WAREHOUSE_ID', 2116);
+define('VO_WAREHOUSE_ID', 2285);
 
 // Billbee
 define('BILLBEE_API_URL', 'https://app.billbee.io/api/v1/');
@@ -186,6 +186,22 @@ function adjustStockForBillbee($stock) {
 function normalizeVoSku($sku) {
   // VentoryOne uses the base SKU (no "-FBM")
   return preg_replace('/-FBM$/', '', $sku);
+}
+
+function billbeeSkuTargets($sku) {
+  $targets = [$sku];
+
+  // Billbee stores some SKUs without their fulfillment suffix (e.g. "-FBM" or "-FBA").
+  if (preg_match('/-(FB[AM])$/i', $sku, $m)) {
+    $base = substr($sku, 0, -strlen($m[0]));
+    if ($base !== '') {
+      $targets[] = $base;
+    }
+  }
+
+  $targets = array_values(array_unique($targets));
+
+  return $targets;
 }
 
 function collectStrings($value, array &$out) {
@@ -482,6 +498,7 @@ function voFetchStockEntry($skuBase, &$note = null) {
 
   $note = 'SKU not found in current_stock';
   $fallbackRow = null;
+  $fallbackNote = null;
 
   foreach ($attempts as $baseUrl) {
     if (!$baseUrl) continue;
@@ -527,9 +544,6 @@ function voFetchStockEntry($skuBase, &$note = null) {
         if (!$skuMatches) continue;
 
         $warehouseIds = extractWarehouseIds($row);
-        if ($warehouseIds && !in_array(VO_WAREHOUSE_ID, $warehouseIds, true)) {
-          continue;
-        }
 
         $metric = null;
         $fieldUsed = null;
@@ -568,6 +582,14 @@ function voFetchStockEntry($skuBase, &$note = null) {
         $row['_metric_field'] = $fieldUsed;
         $row['_metric_value'] = $metric;
 
+        if ($warehouseIds && !in_array(VO_WAREHOUSE_ID, $warehouseIds, true)) {
+          if ($fallbackRow === null) {
+            $fallbackRow = $row;
+            $fallbackNote = 'warehouse mismatch (found ' . implode(',', $warehouseIds) . ')';
+          }
+          continue;
+        }
+
         return $row;
       }
 
@@ -589,6 +611,9 @@ function voFetchStockEntry($skuBase, &$note = null) {
   }
 
   if ($fallbackRow !== null) {
+    if ($fallbackNote !== null) {
+      $note = $fallbackNote;
+    }
     return $fallbackRow;
   }
 
@@ -890,7 +915,17 @@ foreach ($rows as $r) {
 
   // --- Billbee: safety stock logic ---
   $bbQty = adjustStockForBillbee($stock);
-  updateBillbee($csvSku, $bbQty) ? $okBB++ : $failBB++;
+  $bbAllOk = true;
+  foreach (billbeeSkuTargets($csvSku) as $bbSku) {
+    if (!updateBillbee($bbSku, $bbQty)) {
+      $bbAllOk = false;
+    }
+  }
+  if ($bbAllOk) {
+    $okBB++;
+  } else {
+    $failBB++;
+  }
 }
 
 logMsg("✅ Done. VO OK: $okVO/$count | VO Fail: $failVO/$count | Billbee OK: $okBB/$count | Billbee Fail: $failBB/$count");
