@@ -531,34 +531,44 @@ function voFetchStockEntry($skuBase, &$note = null) {
           continue;
         }
 
-        [$metric, $fieldUsed] = voExtractMetricDetails($row);
+        $metric = null;
+        $fieldUsed = null;
+        foreach ([
+          'stk_insgesamt',
+          'qty_total_stock',
+          'total_qty',
+          'total_stock',
+          'qty_loose_stock',
+          'loose_qty',
+          'qty'
+        ] as $field) {
+          if (!array_key_exists($field, $row)) continue;
+          $value = normalizeIntValue($row[$field]);
+          if ($value === null) continue;
+          $metric = $value;
+          $fieldUsed = $field;
+          break;
+        }
 
-        $enrichedRow = $row;
+        if ($metric === null) {
+          $note = 'stock-metric-missing';
+          continue;
+        }
+
+        $note = $fieldUsed . '=' . $metric;
         if ($skuDisplay !== null && strcasecmp($skuDisplay, $skuBase) !== 0) {
-          $enrichedRow['_matched_candidate'] = $skuDisplay;
+          $note .= ' (matched ' . $skuDisplay . ')';
+          $row['_matched_candidate'] = $skuDisplay;
         }
 
         if ($warehouseIds) {
-          $enrichedRow['_warehouse_ids'] = $warehouseIds;
+          $row['_warehouse_ids'] = $warehouseIds;
         }
 
-        if ($metric !== null) {
-          $enrichedRow['_metric_field'] = $fieldUsed;
-          $enrichedRow['_metric_value'] = $metric;
+        $row['_metric_field'] = $fieldUsed;
+        $row['_metric_value'] = $metric;
 
-          $note = ($fieldUsed ? $fieldUsed : 'metric') . '=' . $metric;
-          if (isset($enrichedRow['_matched_candidate'])) {
-            $note .= ' (matched ' . $enrichedRow['_matched_candidate'] . ')';
-          }
-
-          return $enrichedRow;
-        }
-
-        if ($fallbackRow === null) {
-          $fallbackRow = $enrichedRow;
-        }
-
-        $note = 'stock-metric-missing';
+        return $row;
       }
 
       $next = $json['next'] ?? null;
@@ -649,12 +659,12 @@ function voResolveSkuForUpdate(?array $row = null, $skuBase = '', $csvSku = '') 
     ] as $field) {
       if (!array_key_exists($field, $row)) continue;
       $value = $row[$field];
-      if (!is_string($value)) continue;
-
-      $trimmed = trim($value);
-      if ($trimmed === '') continue;
-
-      $candidates[] = $trimmed;
+      if (is_string($value)) {
+        $trimmed = trim($value);
+        if ($trimmed !== '') {
+          $candidates[] = $trimmed;
+        }
+      }
     }
   }
 
@@ -662,54 +672,17 @@ function voResolveSkuForUpdate(?array $row = null, $skuBase = '', $csvSku = '') 
     $candidates[] = $skuBase;
   }
 
-  if (is_string($csvSku) && $csvSku !== '' && strcasecmp($csvSku, $skuBase) !== 0) {
+  if (is_string($csvSku) && $csvSku !== '' && $csvSku !== $skuBase) {
     $candidates[] = $csvSku;
   }
 
-  if (!$candidates) {
-    return $skuBase ?: $csvSku;
-  }
-
-  // Normalise list (dedupe, preserve first occurrence casing)
-  $unique = [];
   foreach ($candidates as $candidate) {
-    $key = strtolower($candidate);
-    if (!array_key_exists($key, $unique)) {
-      $unique[$key] = $candidate;
-    }
-  }
-  $candidates = array_values($unique);
-
-  // 1) exact match for the VentoryOne base SKU (case-insensitive)
-  if ($skuBase !== '') {
-    foreach ($candidates as $candidate) {
-      if (strcasecmp($candidate, $skuBase) === 0) {
-        return $candidate;
-      }
+    if ($candidate !== '') {
+      return $candidate;
     }
   }
 
-  // 2) candidate whose normalised form matches the base and does not introduce suffixes (e.g. -FBM)
-  if ($skuBase !== '') {
-    foreach ($candidates as $candidate) {
-      $normalised = normalizeVoSku($candidate);
-      if (strcasecmp($normalised, $skuBase) === 0 && strcasecmp($candidate, $normalised) === 0) {
-        return $candidate;
-      }
-    }
-  }
-
-  // 3) any candidate that normalises to the base SKU (fallback to whatever the API returns)
-  if ($skuBase !== '') {
-    foreach ($candidates as $candidate) {
-      if (strcasecmp(normalizeVoSku($candidate), $skuBase) === 0) {
-        return $candidate;
-      }
-    }
-  }
-
-  // 4) otherwise keep the first available candidate (already de-duplicated)
-  return $candidates[0];
+  return $skuBase ?: $csvSku;
 }
 
 function voPostAndCheck($path, array $payload) {
