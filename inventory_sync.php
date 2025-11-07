@@ -258,140 +258,6 @@ function extractWarehouseIds(array $row) {
   return $ids;
 }
 
-function stockKeywordScore($text) {
-  if (!is_string($text) || $text === '') return 0;
-
-  $lower = strtolower($text);
-  $keywords = [
-    'stk' => 8,
-    'insgesamt' => 7,
-    'gesamt' => 6,
-    'total' => 6,
-    'sum' => 4,
-    'loose' => 5,
-    'stock' => 5,
-    'inventory' => 4,
-    'qty' => 4,
-    'quantity' => 4,
-    'available' => 3,
-    'pcs' => 2,
-  ];
-
-  $score = 0;
-  foreach ($keywords as $kw => $weight) {
-    if (strpos($lower, $kw) !== false) {
-      $score += $weight;
-    }
-  }
-
-  return $score;
-}
-
-function normalizeIntValue($value) {
-  if (is_int($value)) {
-    return $value;
-  }
-
-  if (is_float($value)) {
-    return (int)round($value);
-  }
-
-  if (is_string($value)) {
-    $trimmed = trim($value);
-    if ($trimmed === '') return null;
-    if (!preg_match('/^-?\d+(?:[\.,]\d+)?$/', $trimmed)) return null;
-    $normalized = str_replace(',', '.', $trimmed);
-    return (int)round((float)$normalized);
-  }
-
-  return null;
-}
-
-function addStockMetricCandidate(array &$candidates, $label, $value, $score) {
-  $intValue = normalizeIntValue($value);
-  if ($intValue === null) return;
-  if ($score <= 0) return;
-
-  $key = strtolower($label);
-  if (!isset($candidates[$key]) || $score > $candidates[$key]['score']) {
-    $candidates[$key] = [
-      'label' => $label,
-      'value' => $intValue,
-      'score' => $score,
-    ];
-  }
-}
-
-function collectStockMetricCandidates($value, array $path, array &$candidates) {
-  if (is_array($value)) {
-    $assoc = $value;
-  } elseif (is_object($value)) {
-    $assoc = get_object_vars($value);
-  } else {
-    $labelParts = array_filter($path, 'is_string');
-    if (!$labelParts) return;
-
-    $label = implode('.', $labelParts);
-    $score = stockKeywordScore($label);
-    addStockMetricCandidate($candidates, $label, $value, $score);
-    return;
-  }
-
-  // detect metric structures like {"name": "STK – Insgesamt", "value": 123}
-  $textKeys = ['name', 'label', 'title', 'metric', 'description', 'display_name', 'displayName'];
-  $valueKeys = ['value', 'qty', 'quantity', 'amount', 'total', 'count', 'stock', 'stock_qty', 'stockQty', 'quantity_total', 'quantityTotal'];
-
-  $textValue = null;
-  $textKeyUsed = null;
-  foreach ($textKeys as $textKey) {
-    if (array_key_exists($textKey, $assoc) && is_string($assoc[$textKey]) && trim($assoc[$textKey]) !== '') {
-      $textValue = trim($assoc[$textKey]);
-      $textKeyUsed = $textKey;
-      break;
-    }
-  }
-
-  if ($textValue !== null) {
-    foreach ($valueKeys as $valueKey) {
-      if (!array_key_exists($valueKey, $assoc)) continue;
-      $score = stockKeywordScore($valueKey) + stockKeywordScore($textValue);
-      $labelParts = array_merge(array_filter($path, 'is_string'), [$valueKey]);
-      $label = implode('.', $labelParts);
-      if ($textKeyUsed) {
-        $label .= ' [' . $textKeyUsed . '=' . $textValue . ']';
-      }
-      addStockMetricCandidate($candidates, $label, $assoc[$valueKey], $score);
-    }
-  }
-
-  foreach ($assoc as $key => $item) {
-    $nextPath = $path;
-    if (is_string($key) && $key !== '') {
-      $nextPath[] = $key;
-    } elseif (!empty($path) && is_int($key)) {
-      $nextPath[] = $key;
-    }
-    collectStockMetricCandidates($item, $nextPath, $candidates);
-  }
-}
-
-function extractStockMetric(array $row) {
-  $candidates = [];
-  collectStockMetricCandidates($row, [], $candidates);
-  if (!$candidates) return [null, null];
-
-  $sorted = array_values($candidates);
-  usort($sorted, function ($a, $b) {
-    if ($a['score'] === $b['score']) {
-      return $b['value'] <=> $a['value'];
-    }
-    return $b['score'] <=> $a['score'];
-  });
-
-  $best = $sorted[0];
-  return [$best['value'], $best['label']];
-}
-
 /* ============ VentoryOne ============ */
 function voSetCartonsZero($skuBase) {
   $url = VO_BASE . '/api/update_plain_carton_line_item_qty/';
@@ -495,19 +361,9 @@ function voVerifyLooseEquals($skuBase, $expect) {
           'qty'
         ] as $field) {
           if (array_key_exists($field, $row)) {
-            $metric = normalizeIntValue($row[$field]);
-            if ($metric !== null) {
-              $fieldUsed = $field;
-              break;
-            }
-          }
-        }
-
-        if ($metric === null) {
-          [$metricCandidate, $metricLabel] = extractStockMetric($row);
-          if ($metricCandidate !== null) {
-            $metric = $metricCandidate;
-            $fieldUsed = $metricLabel ?: 'metric';
+            $metric = (int)$row[$field];
+            $fieldUsed = $field;
+            break;
           }
         }
 
