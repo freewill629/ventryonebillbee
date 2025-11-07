@@ -58,6 +58,15 @@ define('BILLBEE_API_URL', 'https://app.billbee.io/api/v1/');
 define('BILLBEE_USER', 'info@feela.de');
 define('BILLBEE_API_PASSWORD', 'LuPWibuTa7Ngn8m');
 define('BILLBEE_API_KEY', '2FAA5DE0-18EA-4C4E-88EB-F0394109CF2E');
+define('BILLBEE_VELOCITY_LOOKBACK_DAYS', 30);
+define('BILLBEE_VELOCITY_FAST_THRESHOLD', 5.0);  // avg items sold per day → fast seller
+define('BILLBEE_VELOCITY_MEDIUM_THRESHOLD', 1.0); // avg items sold per day → medium seller
+define('BILLBEE_BUFFER_FAST', 20);
+define('BILLBEE_BUFFER_MEDIUM', 10);
+define('BILLBEE_BUFFER_SLOW', 3);
+define('BILLBEE_DEFAULT_CATEGORY', 'slow');
+define('BILLBEE_PAGE_SIZE', 250);
+define('BILLBEE_MAX_PAGES', 40);
 
 // Retry & timeouts
 define('MAX_RETRIES', 3);
@@ -174,12 +183,252 @@ function parseCSV($path) {
 }
 
 /* ===== SAFETY BUFFER for Billbee ===== */
-function adjustStockForBillbee($stock) {
-  // Simple tiered safety stock:
-  if ($stock > 50) return max(0, $stock - 20);  // fast
-  if ($stock > 20) return max(0, $stock - 10);  // medium
-  if ($stock > 5)  return max(0, $stock - 3);   // slow
-  return max(0, $stock - 1);                    // very low
+function canonicalSku($sku) {
+  if (!is_string($sku)) return '';
+  return strtoupper(trim($sku));
+}
+
+function billbeeBufferForCategory($category) {
+  switch (strtolower((string)$category)) {
+    case 'fast':
+      return BILLBEE_BUFFER_FAST;
+    case 'medium':
+      return BILLBEE_BUFFER_MEDIUM;
+    case 'slow':
+    default:
+      return BILLBEE_BUFFER_SLOW;
+  }
+}
+
+function billbeeClassifyDailyRate($avgPerDay) {
+  if (!is_numeric($avgPerDay)) return BILLBEE_DEFAULT_CATEGORY;
+  if ($avgPerDay >= BILLBEE_VELOCITY_FAST_THRESHOLD) {
+    return 'fast';
+  }
+  if ($avgPerDay >= BILLBEE_VELOCITY_MEDIUM_THRESHOLD) {
+    return 'medium';
+  }
+  return 'slow';
+}
+
+function adjustStockForBillbee($stock, $category) {
+  $buffer = billbeeBufferForCategory($category);
+  $buffer = min($buffer, max(0, (int)$stock));
+  return max(0, (int)$stock - $buffer);
+}
+
+function billbeeBaseHeaders() {
+  $auth = base64_encode(BILLBEE_USER . ':' . BILLBEE_API_PASSWORD);
+  return [
+    'Authorization: Basic ' . $auth,
+    'X-Billbee-Api-Key: ' . BILLBEE_API_KEY,
+    'Accept: application/json'
+  ];
+}
+
+function billbeeApiRequest($path, array $query = []) {
+  $url = rtrim(BILLBEE_API_URL, '/') . '/' . ltrim($path, '/');
+  if ($query) {
+    $url .= '?' . http_build_query($query);
+  }
+  $headers = billbeeBaseHeaders();
+
+  [$code, $resp, $curlErr, $verbose] = httpJsonWithRetry($url, 'GET', $headers, null);
+  if (!($code >= 200 && $code < 300)) {
+    $extra = $curlErr ?: trim($verbose);
+    return [null, 'HTTP ' . $code . ($extra ? ' | ' . $extra : '')];
+  }
+
+  if ($resp === null || $resp === '') {
+    return [[], null];
+  }
+
+  $json = json_decode($resp, true);
+  if (!is_array($json)) {
+    return [null, 'invalid-json'];
+  }
+
+  return [$json, null];
+}
+
+function billbeeExtractOrderItems(array $order) {
+  $candidateKeys = ['OrderItems', 'orderItems', 'Items', 'items', 'Positions', 'positions', 'Products', 'products'];
+  foreach ($candidateKeys as $key) {
+    if (!array_key_exists($key, $order)) continue;
+    $items = $order[$key];
+    if (is_array($items)) {
+      $filtered = array_values(array_filter($items, 'is_array'));
+      if ($filtered) {
+        return $filtered;
+      }
+    }
+  }
+
+  foreach ($order as $value) {
+    if (!is_array($value)) continue;
+    foreach ($value as $sub) {
+      if (!is_array($sub)) continue;
+      $filtered = array_values(array_filter($sub, 'is_array'));
+      foreach ($filtered as $item) {
+        if (is_array($item) && (array_key_exists('Quantity', $item) || array_key_exists('quantity', $item))) {
+          return $filtered;
+        }
+      }
+    }
+  }
+
+  return [];
+}
+
+function billbeeExtractOrderItemQuantity(array $item) {
+  foreach (['Quantity', 'quantity', 'Amount', 'amount'] as $field) {
+    if (!array_key_exists($field, $item)) continue;
+    $value = normalizeIntValue($item[$field]);
+    if ($value !== null) return $value;
+  }
+  return null;
+}
+
+function billbeeExtractOrderItemSku(array $item) {
+  foreach (extractSkuCandidates($item) as $candidate) {
+    if ($candidate !== '') {
+      return $candidate;
+    }
+  }
+  if (isset($item['Product']) && is_array($item['Product'])) {
+    foreach (extractSkuCandidates($item['Product']) as $candidate) {
+      if ($candidate !== '') {
+        return $candidate;
+      }
+    }
+  }
+  return null;
+}
+
+function billbeeFetchSalesVelocities($lookbackDays) {
+  $days = max(1, (int)$lookbackDays);
+  $since = (new \DateTimeImmutable('now'))->modify('-' . $days . ' days')->setTime(0, 0, 0)->format('c');
+
+  $page = 1;
+  $pagesFetched = 0;
+  $ordersProcessed = 0;
+  $itemsProcessed = 0;
+  $quantityBySku = [];
+
+  while ($page <= BILLBEE_MAX_PAGES) {
+    $query = [
+      'page' => $page,
+      'pageSize' => BILLBEE_PAGE_SIZE,
+      'minOrderDate' => $since,
+      'expand' => 'orderitems'
+    ];
+
+    [$payload, $err] = billbeeApiRequest('orders', $query);
+    if ($err !== null) {
+      return [
+        'ok' => false,
+        'info' => [],
+        'counts' => ['fast' => 0, 'medium' => 0, 'slow' => 0],
+        'orders' => $ordersProcessed,
+        'items' => $itemsProcessed,
+        'window_days' => $days,
+        'pages' => $pagesFetched,
+        'error' => $err
+      ];
+    }
+
+    $orders = [];
+    if (isset($payload['data']) && is_array($payload['data'])) {
+      $orders = $payload['data'];
+    } elseif (isset($payload['Data']) && is_array($payload['Data'])) {
+      $orders = $payload['Data'];
+    } elseif (isset($payload['results']) && is_array($payload['results'])) {
+      $orders = $payload['results'];
+    } elseif (isset($payload['Results']) && is_array($payload['Results'])) {
+      $orders = $payload['Results'];
+    } elseif (isset($payload['orders']) && is_array($payload['orders'])) {
+      $orders = $payload['orders'];
+    } elseif (isset($payload['Orders']) && is_array($payload['Orders'])) {
+      $orders = $payload['Orders'];
+    } elseif (array_values($payload) === $payload) {
+      $orders = $payload;
+    }
+
+    if (!$orders) {
+      break;
+    }
+
+    foreach ($orders as $order) {
+      if (!is_array($order)) continue;
+      $ordersProcessed++;
+      $items = billbeeExtractOrderItems($order);
+      foreach ($items as $item) {
+        if (!is_array($item)) continue;
+        $sku = billbeeExtractOrderItemSku($item);
+        $qty = billbeeExtractOrderItemQuantity($item);
+        if ($sku === null || $sku === '' || $qty === null || $qty <= 0) continue;
+        foreach (billbeeSkuTargets($sku) as $candidate) {
+          $canon = canonicalSku($candidate);
+          if ($canon === '') continue;
+          if (!array_key_exists($canon, $quantityBySku)) {
+            $quantityBySku[$canon] = 0;
+          }
+          $quantityBySku[$canon] += $qty;
+        }
+        $itemsProcessed++;
+      }
+    }
+
+    $pagesFetched++;
+    if (count($orders) < BILLBEE_PAGE_SIZE) {
+      break;
+    }
+    $page++;
+  }
+
+  if ($page > BILLBEE_MAX_PAGES) {
+    logMsg('⚠️ Billbee velocity reached max page limit (' . BILLBEE_MAX_PAGES . ')');
+  }
+
+  $info = [];
+  $counts = ['fast' => 0, 'medium' => 0, 'slow' => 0];
+  foreach ($quantityBySku as $canon => $qty) {
+    $avgPerDay = $qty / $days;
+    $category = billbeeClassifyDailyRate($avgPerDay);
+    if (!isset($counts[$category])) {
+      $counts[$category] = 0;
+    }
+    $counts[$category]++;
+    $info[$canon] = [
+      'total_quantity' => $qty,
+      'daily_rate' => $avgPerDay,
+      'category' => $category
+    ];
+  }
+
+  return [
+    'ok' => true,
+    'info' => $info,
+    'counts' => $counts,
+    'orders' => $ordersProcessed,
+    'items' => $itemsProcessed,
+    'window_days' => $days,
+    'pages' => $pagesFetched
+  ];
+}
+
+function billbeeResolveVelocityForSku($sku, array $velocityInfo) {
+  $candidates = array_merge([$sku], billbeeSkuTargets($sku));
+  $seen = [];
+  foreach ($candidates as $candidate) {
+    $canon = canonicalSku($candidate);
+    if ($canon === '' || isset($seen[$canon])) continue;
+    $seen[$canon] = true;
+    if (array_key_exists($canon, $velocityInfo)) {
+      return $velocityInfo[$canon];
+    }
+  }
+  return null;
 }
 
 /* ============ Helpers ============ */
@@ -873,13 +1122,7 @@ function updateVentoryTotal($csvSku, $total) {
 /* ============== Billbee ============== */
 function updateBillbee($sku, $qty) {
   $url = BILLBEE_API_URL . 'products/updatestock';
-  $auth = base64_encode(BILLBEE_USER . ':' . BILLBEE_API_PASSWORD);
-  $headers = [
-    'Authorization: Basic ' . $auth,
-    'X-Billbee-Api-Key: ' . BILLBEE_API_KEY,
-    'Content-Type: application/json',
-    'Accept: application/json'
-  ];
+  $headers = array_merge(billbeeBaseHeaders(), ['Content-Type: application/json']);
   $payload = [
     'Sku'         => $sku,
     'NewQuantity' => (int)$qty,
@@ -904,6 +1147,34 @@ $rows = parseCSV($csv);
 $count = count($rows);
 logMsg("📦 Found $count SKUs in stock file");
 
+$billbeeVelocityData = billbeeFetchSalesVelocities(BILLBEE_VELOCITY_LOOKBACK_DAYS);
+$billbeeVelocityInfo = $billbeeVelocityData['info'] ?? [];
+if (!empty($billbeeVelocityData['ok'])) {
+  $counts = $billbeeVelocityData['counts'] ?? ['fast' => 0, 'medium' => 0, 'slow' => 0];
+  $summary = sprintf(
+    '📈 Billbee sales velocity %dd → orders=%d, items=%d, tracked SKUs=%d | fast=%d, medium=%d, slow=%d',
+    $billbeeVelocityData['window_days'] ?? BILLBEE_VELOCITY_LOOKBACK_DAYS,
+    $billbeeVelocityData['orders'] ?? 0,
+    $billbeeVelocityData['items'] ?? 0,
+    count($billbeeVelocityInfo),
+    $counts['fast'] ?? 0,
+    $counts['medium'] ?? 0,
+    $counts['slow'] ?? 0
+  );
+  logMsg($summary);
+  if (($billbeeVelocityData['pages'] ?? 0) >= BILLBEE_MAX_PAGES) {
+    logMsg('⚠️ Billbee velocity may be truncated due to page limit');
+  }
+} else {
+  $error = $billbeeVelocityData['error'] ?? 'unknown error';
+  logMsg('⚠️ Billbee velocity data unavailable: ' . $error);
+  $billbeeVelocityInfo = [];
+}
+
+$billbeeCategoryCounters = ['fast' => 0, 'medium' => 0, 'slow' => 0, 'fallback' => 0];
+$billbeeVelocityLogCount = 0;
+$billbeeFallbackLogCount = 0;
+
 $okVO = 0; $failVO = 0; $okBB = 0; $failBB = 0;
 
 foreach ($rows as $r) {
@@ -914,7 +1185,30 @@ foreach ($rows as $r) {
   if (updateVentoryTotal($csvSku, $stock)) $okVO++; else $failVO++;
 
   // --- Billbee: safety stock logic ---
-  $bbQty = adjustStockForBillbee($stock);
+  $velocityInfo = billbeeResolveVelocityForSku($csvSku, $billbeeVelocityInfo);
+  if ($velocityInfo === null) {
+    $category = BILLBEE_DEFAULT_CATEGORY;
+    $billbeeCategoryCounters['fallback']++;
+    $billbeeCategoryCounters[$category]++;
+    if ($billbeeFallbackLogCount < 5) {
+      logMsg('ℹ️ Billbee velocity fallback for ' . $csvSku . ' → category=' . $category);
+      $billbeeFallbackLogCount++;
+    }
+  } else {
+    $category = $velocityInfo['category'];
+    if (!isset($billbeeCategoryCounters[$category])) {
+      $billbeeCategoryCounters[$category] = 0;
+    }
+    $billbeeCategoryCounters[$category]++;
+    if ($billbeeVelocityLogCount < 5) {
+      $keep = billbeeBufferForCategory($category);
+      $daily = number_format($velocityInfo['daily_rate'], 2);
+      logMsg("ℹ️ Billbee velocity $csvSku → $category (avg $daily/day, keep $keep)");
+      $billbeeVelocityLogCount++;
+    }
+  }
+
+  $bbQty = adjustStockForBillbee($stock, $category);
   $bbAllOk = true;
   foreach (billbeeSkuTargets($csvSku) as $bbSku) {
     if (!updateBillbee($bbSku, $bbQty)) {
@@ -927,5 +1221,14 @@ foreach ($rows as $r) {
     $failBB++;
   }
 }
+
+$usedSummary = sprintf(
+  '📊 Billbee categories used this run → fast=%d, medium=%d, slow=%d, fallback=%d',
+  $billbeeCategoryCounters['fast'] ?? 0,
+  $billbeeCategoryCounters['medium'] ?? 0,
+  $billbeeCategoryCounters['slow'] ?? 0,
+  $billbeeCategoryCounters['fallback'] ?? 0
+);
+logMsg($usedSummary);
 
 logMsg("✅ Done. VO OK: $okVO/$count | VO Fail: $failVO/$count | Billbee OK: $okBB/$count | Billbee Fail: $failBB/$count");
