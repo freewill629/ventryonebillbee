@@ -24,55 +24,8 @@ define('CSV_SKU_COL', 'Variant SKU');
 define('CSV_QTY_COL', 'Inventory Available: Cafol DE');
 
 define('LOCAL_CSV_DIR', __DIR__ . '/csv_files');
-define('LOG_DIR', __DIR__ . '/logs');
-
-function interpretEnvBool($value) {
-  $value = strtolower(trim($value));
-  if ($value === '' || $value === 'auto') return null;
-  if (in_array($value, ['1', 'true', 'yes', 'on'], true)) return true;
-  if (in_array($value, ['0', 'false', 'no', 'off'], true)) return false;
-  return null;
-}
-
-function detectLogEchoEnabled() {
-  $override = getenv('SYNC_LOG_ECHO');
-  if ($override !== false) {
-    $parsed = interpretEnvBool($override);
-    if ($parsed !== null) return $parsed;
-  }
-
-  $signals = [];
-  if (defined('STDOUT')) {
-    if (function_exists('stream_isatty')) {
-      $signals[] = @stream_isatty(STDOUT);
-    }
-    if (function_exists('posix_isatty')) {
-      $signals[] = @posix_isatty(STDOUT);
-    }
-  }
-
-  if (in_array(true, $signals, true)) {
-    return true;
-  }
-  if (!empty($signals) && !in_array(null, $signals, true) && !in_array(true, $signals, true)) {
-    return false;
-  }
-
-  $term = getenv('TERM');
-  if (PHP_SAPI === 'cli' && $term && strtolower($term) !== 'dumb') {
-    return true;
-  }
-
-  return PHP_SAPI === 'cli';
-}
-
-define('LOG_ECHO_ENABLED', detectLogEchoEnabled()); // override with SYNC_LOG_ECHO
-
-if (!is_dir(LOG_DIR) && !mkdir(LOG_DIR, 0777, true) && !is_dir(LOG_DIR)) {
-  fwrite(STDERR, "Cannot create log directory: " . LOG_DIR . PHP_EOL);
-  exit(1);
-}
-define('LOG_FILE', LOG_DIR . '/sync_' . date('Ymd_His') . '.log');
+define('LOG_FILE', __DIR__ . '/sync_' . date('Ymd_His') . '.log');
+define('LOG_ECHO_ENABLED', false); // disable stdout noise to avoid cron email spam
 
 // VentoryOne (2116 = cafol warehouse)
 define('VO_BASE', 'https://app.ventory.one');
@@ -214,13 +167,114 @@ function normalizeVoSku($sku) {
   return preg_replace('/-FBM$/', '', $sku);
 }
 
-function extractIntFromMixed($value) {
-  if (is_int($value)) return $value;
-  if (is_float($value)) return (int)round($value);
-  if (is_string($value) && preg_match('/^-?\d+$/', trim($value))) {
-    return (int)trim($value);
+function collectStrings($value, array &$out) {
+  if (is_string($value)) {
+    $trimmed = trim($value);
+    if ($trimmed !== '') $out[] = $trimmed;
+    return;
   }
-  return null;
+
+  if (is_array($value)) {
+    foreach ($value as $item) collectStrings($item, $out);
+    return;
+  }
+
+  if (is_object($value)) {
+    foreach (get_object_vars($value) as $item) collectStrings($item, $out);
+  }
+}
+
+function collectWarehouseIds($value, array &$out) {
+  if ($value === null) return;
+
+  if (is_int($value)) {
+    $out[] = $value;
+    return;
+  }
+
+  if (is_string($value) && preg_match('/^-?\d+$/', trim($value))) {
+    $out[] = (int)trim($value);
+    return;
+  }
+
+  if (is_float($value)) {
+    $out[] = (int)$value;
+    return;
+  }
+
+  if (is_array($value)) {
+    foreach ($value as $key => $item) {
+      if (is_string($key)) {
+        $lower = strtolower($key);
+        if (strpos($lower, 'warehouse') !== false || strpos($lower, 'id') !== false) {
+          collectWarehouseIds($item, $out);
+        }
+      } else {
+        collectWarehouseIds($item, $out);
+      }
+    }
+    return;
+  }
+
+  if (is_object($value)) {
+    collectWarehouseIds(get_object_vars($value), $out);
+  }
+}
+
+function extractSkuCandidates(array $row) {
+  $preferredKeys = [
+    'sku', 'sku_code', 'skuCode', 'sku_name', 'skuName', 'sku_full_name',
+    'skuFullName', 'sku_display_name', 'skuDisplayName', 'name', 'skuValue',
+    'sku_value', 'sku_number', 'skuNumber'
+  ];
+
+  $candidates = [];
+
+  foreach ($preferredKeys as $key) {
+    if (!array_key_exists($key, $row)) continue;
+    collectStrings($row[$key], $candidates);
+  }
+
+  if (!$candidates) {
+    // Fallback: scan nested structures for matching strings.
+    collectStrings($row, $candidates);
+  }
+
+  $candidates = array_values(array_unique(array_filter($candidates, fn($s) => $s !== '')));
+
+  return $candidates;
+}
+
+function extractWarehouseIds(array $row) {
+  $ids = [];
+
+  foreach (['warehouse_id', 'warehouse', 'warehouse_info'] as $key) {
+    if (!array_key_exists($key, $row)) continue;
+    collectWarehouseIds($row[$key], $ids);
+  }
+
+  $ids = array_values(array_unique(array_map('intval', $ids)));
+
+  return $ids;
+}
+
+/* ============ VentoryOne ============ */
+function voSetCartonsZero($skuBase) {
+  $url = VO_BASE . '/api/update_plain_carton_line_item_qty/';
+  $headers = [
+    'Authorization: Bearer ' . VO_TOKEN,
+    'Content-Type: application/json',
+    'Accept: application/json'
+  ];
+  $payload = [
+    'warehouse_id' => VO_WAREHOUSE_ID,
+    'sku_qty_list' => [[
+      'sku'        => $skuBase,
+      'carton_qty' => 0
+    ]]
+  ];
+  [$code, $resp] = httpJsonWithRetry($url, 'POST', $headers, $payload);
+  return $code >= 200 && $code < 300;
 }
 
 function collectStrings($value, array &$out) {
@@ -526,11 +580,11 @@ function voFetchStockEntry($skuBase, &$note = null) {
       foreach ($rows as $row) {
         if (!is_array($row)) continue;
 
-        $matchedCandidate = null;
+        $skuDisplay = null;
         $skuMatches = false;
         foreach (extractSkuCandidates($row) as $candidate) {
           if (strcasecmp($candidate, $skuBase) === 0 || strcasecmp(normalizeVoSku($candidate), $skuBase) === 0) {
-            $matchedCandidate = $candidate;
+            $skuDisplay = $candidate;
             $skuMatches = true;
             break;
           }
@@ -543,10 +597,34 @@ function voFetchStockEntry($skuBase, &$note = null) {
           continue;
         }
 
-        $row['_matched_candidate'] = $matchedCandidate ?: $skuBase;
-        $row['_warehouse_ids'] = $warehouseIds;
+        $metric = null;
+        $fieldUsed = null;
+        foreach ([
+          'stk_insgesamt',
+          'qty_total_stock',
+          'total_qty',
+          'total_stock',
+          'qty_loose_stock',
+          'loose_qty',
+          'qty'
+        ] as $field) {
+          if (array_key_exists($field, $row)) {
+            $metric = (int)$row[$field];
+            $fieldUsed = $field;
+            break;
+          }
+        }
 
-        return $row;
+        if ($metric === null) {
+          return [false, 'stock-metric-missing'];
+        }
+
+        $note = $fieldUsed . '=' . $metric;
+        if ($skuDisplay !== null && strcasecmp($skuDisplay, $skuBase) !== 0) {
+          $note .= ' (matched ' . $skuDisplay . ')';
+        }
+
+        return [$metric === (int)$expect, $note];
       }
 
       $next = $json['next'] ?? null;
