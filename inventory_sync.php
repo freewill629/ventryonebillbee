@@ -164,6 +164,231 @@ function normalizeVoSku($sku) {
   return preg_replace('/-FBM$/', '', $sku);
 }
 
+function collectStrings($value, array &$out) {
+  if (is_string($value)) {
+    $trimmed = trim($value);
+    if ($trimmed !== '') $out[] = $trimmed;
+    return;
+  }
+
+  if (is_array($value)) {
+    foreach ($value as $item) collectStrings($item, $out);
+    return;
+  }
+
+  if (is_object($value)) {
+    foreach (get_object_vars($value) as $item) collectStrings($item, $out);
+  }
+}
+
+function collectWarehouseIds($value, array &$out) {
+  if ($value === null) return;
+
+  if (is_int($value)) {
+    $out[] = $value;
+    return;
+  }
+
+  if (is_string($value) && preg_match('/^-?\d+$/', trim($value))) {
+    $out[] = (int)trim($value);
+    return;
+  }
+
+  if (is_float($value)) {
+    $out[] = (int)$value;
+    return;
+  }
+
+  if (is_array($value)) {
+    foreach ($value as $key => $item) {
+      if (is_string($key)) {
+        $lower = strtolower($key);
+        if (strpos($lower, 'warehouse') !== false || strpos($lower, 'id') !== false) {
+          collectWarehouseIds($item, $out);
+        }
+      } else {
+        collectWarehouseIds($item, $out);
+      }
+    }
+    return;
+  }
+
+  if (is_object($value)) {
+    collectWarehouseIds(get_object_vars($value), $out);
+  }
+}
+
+function extractSkuCandidates(array $row) {
+  $preferredKeys = [
+    'sku', 'sku_code', 'skuCode', 'sku_name', 'skuName', 'sku_full_name',
+    'skuFullName', 'sku_display_name', 'skuDisplayName', 'name', 'skuValue',
+    'sku_value', 'sku_number', 'skuNumber'
+  ];
+
+  $candidates = [];
+
+  foreach ($preferredKeys as $key) {
+    if (!array_key_exists($key, $row)) continue;
+    collectStrings($row[$key], $candidates);
+  }
+
+  if (!$candidates) {
+    // Fallback: scan nested structures for matching strings.
+    collectStrings($row, $candidates);
+  }
+
+  $candidates = array_values(array_unique(array_filter($candidates, fn($s) => $s !== '')));
+
+  return $candidates;
+}
+
+function extractWarehouseIds(array $row) {
+  $ids = [];
+
+  foreach (['warehouse_id', 'warehouse', 'warehouse_info'] as $key) {
+    if (!array_key_exists($key, $row)) continue;
+    collectWarehouseIds($row[$key], $ids);
+  }
+
+  $ids = array_values(array_unique(array_map('intval', $ids)));
+
+  return $ids;
+}
+
+function stockKeywordScore($text) {
+  if (!is_string($text) || $text === '') return 0;
+
+  $lower = strtolower($text);
+  $keywords = [
+    'stk' => 8,
+    'insgesamt' => 7,
+    'gesamt' => 6,
+    'total' => 6,
+    'sum' => 4,
+    'loose' => 5,
+    'stock' => 5,
+    'inventory' => 4,
+    'qty' => 4,
+    'quantity' => 4,
+    'available' => 3,
+    'pcs' => 2,
+  ];
+
+  $score = 0;
+  foreach ($keywords as $kw => $weight) {
+    if (strpos($lower, $kw) !== false) {
+      $score += $weight;
+    }
+  }
+
+  return $score;
+}
+
+function normalizeIntValue($value) {
+  if (is_int($value)) {
+    return $value;
+  }
+
+  if (is_float($value)) {
+    return (int)round($value);
+  }
+
+  if (is_string($value)) {
+    $trimmed = trim($value);
+    if ($trimmed === '') return null;
+    if (!preg_match('/^-?\d+(?:[\.,]\d+)?$/', $trimmed)) return null;
+    $normalized = str_replace(',', '.', $trimmed);
+    return (int)round((float)$normalized);
+  }
+
+  return null;
+}
+
+function addStockMetricCandidate(array &$candidates, $label, $value, $score) {
+  $intValue = normalizeIntValue($value);
+  if ($intValue === null) return;
+  if ($score <= 0) return;
+
+  $key = strtolower($label);
+  if (!isset($candidates[$key]) || $score > $candidates[$key]['score']) {
+    $candidates[$key] = [
+      'label' => $label,
+      'value' => $intValue,
+      'score' => $score,
+    ];
+  }
+}
+
+function collectStockMetricCandidates($value, array $path, array &$candidates) {
+  if (is_array($value)) {
+    $assoc = $value;
+  } elseif (is_object($value)) {
+    $assoc = get_object_vars($value);
+  } else {
+    $labelParts = array_filter($path, 'is_string');
+    if (!$labelParts) return;
+
+    $label = implode('.', $labelParts);
+    $score = stockKeywordScore($label);
+    addStockMetricCandidate($candidates, $label, $value, $score);
+    return;
+  }
+
+  // detect metric structures like {"name": "STK – Insgesamt", "value": 123}
+  $textKeys = ['name', 'label', 'title', 'metric', 'description', 'display_name', 'displayName'];
+  $valueKeys = ['value', 'qty', 'quantity', 'amount', 'total', 'count', 'stock', 'stock_qty', 'stockQty', 'quantity_total', 'quantityTotal'];
+
+  $textValue = null;
+  $textKeyUsed = null;
+  foreach ($textKeys as $textKey) {
+    if (array_key_exists($textKey, $assoc) && is_string($assoc[$textKey]) && trim($assoc[$textKey]) !== '') {
+      $textValue = trim($assoc[$textKey]);
+      $textKeyUsed = $textKey;
+      break;
+    }
+  }
+
+  if ($textValue !== null) {
+    foreach ($valueKeys as $valueKey) {
+      if (!array_key_exists($valueKey, $assoc)) continue;
+      $score = stockKeywordScore($valueKey) + stockKeywordScore($textValue);
+      $labelParts = array_merge(array_filter($path, 'is_string'), [$valueKey]);
+      $label = implode('.', $labelParts);
+      if ($textKeyUsed) {
+        $label .= ' [' . $textKeyUsed . '=' . $textValue . ']';
+      }
+      addStockMetricCandidate($candidates, $label, $assoc[$valueKey], $score);
+    }
+  }
+
+  foreach ($assoc as $key => $item) {
+    $nextPath = $path;
+    if (is_string($key) && $key !== '') {
+      $nextPath[] = $key;
+    } elseif (!empty($path) && is_int($key)) {
+      $nextPath[] = $key;
+    }
+    collectStockMetricCandidates($item, $nextPath, $candidates);
+  }
+}
+
+function extractStockMetric(array $row) {
+  $candidates = [];
+  collectStockMetricCandidates($row, [], $candidates);
+  if (!$candidates) return [null, null];
+
+  $sorted = array_values($candidates);
+  usort($sorted, function ($a, $b) {
+    if ($a['score'] === $b['score']) {
+      return $b['value'] <=> $a['value'];
+    }
+    return $b['score'] <=> $a['score'];
+  });
+
+  $best = $sorted[0];
+  return [$best['value'], $best['label']];
+}
+
 /* ============ VentoryOne ============ */
 function voSetCartonsZero($skuBase) {
   $url = VO_BASE . '/api/update_plain_carton_line_item_qty/';
@@ -238,43 +463,61 @@ function voVerifyLooseEquals($skuBase, $expect) {
       foreach ($rows as $row) {
         if (!is_array($row)) continue;
 
-        $skuCandidate = (string)($row['sku'] ?? $row['sku_code'] ?? $row['skuName'] ?? '');
-
-        $warehouseRaw = $row['warehouse_id'] ?? $row['warehouse'] ?? null;
-        $warehouseId = null;
-        if (is_array($warehouseRaw)) {
-          $warehouseId = (int)($warehouseRaw['id'] ?? $warehouseRaw['pk'] ?? 0);
-        } elseif (is_object($warehouseRaw)) {
-          $warehouseId = (int)($warehouseRaw->id ?? $warehouseRaw->pk ?? 0);
-        } elseif ($warehouseRaw !== null) {
-          $warehouseId = (int)$warehouseRaw;
+        $skuDisplay = null;
+        $skuMatches = false;
+        foreach (extractSkuCandidates($row) as $candidate) {
+          if (strcasecmp($candidate, $skuBase) === 0 || strcasecmp(normalizeVoSku($candidate), $skuBase) === 0) {
+            $skuDisplay = $candidate;
+            $skuMatches = true;
+            break;
+          }
         }
 
-        if (strcasecmp($skuCandidate, $skuBase) === 0 && ($warehouseId === null || $warehouseId === VO_WAREHOUSE_ID)) {
-          $metric = null;
-          $fieldUsed = null;
-          foreach ([
-            'stk_insgesamt',
-            'qty_total_stock',
-            'total_qty',
-            'total_stock',
-            'qty_loose_stock',
-            'loose_qty',
-            'qty'
-          ] as $field) {
-            if (array_key_exists($field, $row)) {
-              $metric = (int)$row[$field];
+        if (!$skuMatches) continue;
+
+        $warehouseIds = extractWarehouseIds($row);
+        if ($warehouseIds && !in_array(VO_WAREHOUSE_ID, $warehouseIds, true)) {
+          continue;
+        }
+
+        $metric = null;
+        $fieldUsed = null;
+        foreach ([
+          'stk_insgesamt',
+          'qty_total_stock',
+          'total_qty',
+          'total_stock',
+          'qty_loose_stock',
+          'loose_qty',
+          'qty'
+        ] as $field) {
+          if (array_key_exists($field, $row)) {
+            $metric = normalizeIntValue($row[$field]);
+            if ($metric !== null) {
               $fieldUsed = $field;
               break;
             }
           }
-
-          if ($metric === null) {
-            return [false, 'stock-metric-missing'];
-          }
-
-          return [$metric === (int)$expect, $fieldUsed . '=' . $metric];
         }
+
+        if ($metric === null) {
+          [$metricCandidate, $metricLabel] = extractStockMetric($row);
+          if ($metricCandidate !== null) {
+            $metric = $metricCandidate;
+            $fieldUsed = $metricLabel ?: 'metric';
+          }
+        }
+
+        if ($metric === null) {
+          return [false, 'stock-metric-missing'];
+        }
+
+        $note = $fieldUsed . '=' . $metric;
+        if ($skuDisplay !== null && strcasecmp($skuDisplay, $skuBase) !== 0) {
+          $note .= ' (matched ' . $skuDisplay . ')';
+        }
+
+        return [$metric === (int)$expect, $note];
       }
 
       $next = $json['next'] ?? null;
