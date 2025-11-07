@@ -481,6 +481,7 @@ function voFetchStockEntry($skuBase, &$note = null) {
   ];
 
   $note = 'SKU not found in current_stock';
+  $fallbackRow = null;
 
   foreach ($attempts as $baseUrl) {
     if (!$baseUrl) continue;
@@ -583,6 +584,10 @@ function voFetchStockEntry($skuBase, &$note = null) {
         $url = null;
       }
     }
+  }
+
+  if ($fallbackRow !== null) {
+    return $fallbackRow;
   }
 
   return null;
@@ -769,6 +774,8 @@ function updateVentoryTotal($csvSku, $total) {
 
   if (!$lookupRow && $lookupNote) {
     logMsg("ℹ️ VO lookup $skuBase before update: $lookupNote");
+  } elseif ($lookupRow && !array_key_exists('_metric_value', $lookupRow)) {
+    logMsg("ℹ️ VO lookup $skuBase before update: stock-metric-missing");
   }
 
   [$okC, $cartonNote] = voSetCartonsZero($ident);
