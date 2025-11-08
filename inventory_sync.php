@@ -1411,6 +1411,9 @@ if (!empty($billbeeVelocityData['ok'])) {
 
 $billbeeCategoryCounters = ['fast' => 0, 'medium' => 0, 'slow' => 0];
 $billbeeSourceCounters = ['billbee' => 0, 'ventoryone' => 0, 'default' => 0];
+$billbeeVelocityLogCount = 0;
+$voVelocityLogCount = 0;
+$billbeeFallbackLogCount = 0;
 
 $okVO = 0; $failVO = 0; $okBB = 0; $failBB = 0;
 
@@ -1429,31 +1432,40 @@ foreach ($rows as $r) {
   if ($velocityInfo !== null) {
     $category = $velocityInfo['category'];
     $source = 'billbee';
-    $keep = billbeeBufferForCategory($category);
-    $daily = formatNumberForLog($velocityInfo['daily_rate'] ?? 0);
-    logMsg("ℹ️ Billbee velocity $csvSku → $category (avg $daily/day, keep $keep)");
+    if ($billbeeVelocityLogCount < 5) {
+      $keep = billbeeBufferForCategory($category);
+      $daily = formatNumberForLog($velocityInfo['daily_rate'] ?? 0);
+      logMsg("ℹ️ Billbee velocity $csvSku → $category (avg $daily/day, keep $keep)");
+      $billbeeVelocityLogCount++;
+    }
   } else {
     $voVelocity = voResolveSalesVelocity($csvSku);
     if ($voVelocity !== null) {
       $category = $voVelocity['category'];
       $source = 'ventoryone';
-      $keep = billbeeBufferForCategory($category);
-      $daily = formatNumberForLog($voVelocity['daily_rate'] ?? 0);
-      $raw = formatNumberForLog($voVelocity['raw_value'] ?? ($voVelocity['daily_rate'] ?? 0));
-      $window = $voVelocity['window_days'] ?? BILLBEE_VELOCITY_LOOKBACK_DAYS;
-      $sourceField = $voVelocity['source_field'] ?? 'vo';
-      if (!empty($voVelocity['per_day'])) {
-        $sourceDetail = $sourceField . '=' . $raw . '/day';
-      } else {
-        $sourceDetail = $sourceField . '=' . $raw . ' over ' . (int)$window . 'd';
+      if ($voVelocityLogCount < 5) {
+        $keep = billbeeBufferForCategory($category);
+        $daily = formatNumberForLog($voVelocity['daily_rate'] ?? 0);
+        $raw = formatNumberForLog($voVelocity['raw_value'] ?? ($voVelocity['daily_rate'] ?? 0));
+        $window = $voVelocity['window_days'] ?? BILLBEE_VELOCITY_LOOKBACK_DAYS;
+        $sourceField = $voVelocity['source_field'] ?? 'vo';
+        if (!empty($voVelocity['per_day'])) {
+          $sourceDetail = $sourceField . '=' . $raw . '/day';
+        } else {
+          $sourceDetail = $sourceField . '=' . $raw . ' over ' . (int)$window . 'd';
+        }
+        $sourcePath = $voVelocity['source_path'] ?? '';
+        if ($sourcePath !== '' && strcasecmp($sourcePath, $sourceField) !== 0) {
+          $sourceDetail .= ' @ ' . $sourcePath;
+        }
+        logMsg("ℹ️ VentoryOne velocity $csvSku → $category (avg $daily/day, keep $keep, source $sourceDetail)");
+        $voVelocityLogCount++;
       }
-      $sourcePath = $voVelocity['source_path'] ?? '';
-      if ($sourcePath !== '' && strcasecmp($sourcePath, $sourceField) !== 0) {
-        $sourceDetail .= ' @ ' . $sourcePath;
-      }
-      logMsg("ℹ️ VentoryOne velocity $csvSku → $category (avg $daily/day, keep $keep, source $sourceDetail)");
     } else {
-      logMsg('ℹ️ Billbee velocity fallback for ' . $csvSku . ' → category=' . $category . ' (no Billbee/VO data)');
+      if ($billbeeFallbackLogCount < 5) {
+        logMsg('ℹ️ Billbee velocity fallback for ' . $csvSku . ' → category=' . $category . ' (no Billbee/VO data)');
+        $billbeeFallbackLogCount++;
+      }
     }
   }
 
