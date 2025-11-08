@@ -74,6 +74,10 @@ define('RETRY_BASE_MS', 600);
 define('CONNECT_TIMEOUT', 15);
 define('REQUEST_TIMEOUT', 45);
 
+// Simple caches populated during runtime to avoid repeated VO lookups per SKU.
+$VO_STOCK_CACHE = [];
+$VO_VELOCITY_CACHE = [];
+
 /* ================ LOGGING ================= */
 function logMsg($msg) {
   $line = '[' . date('Y-m-d H:i:s') . '] ' . $msg . PHP_EOL;
@@ -613,6 +617,27 @@ function normalizeIntValue($value) {
   return null;
 }
 
+function normalizeFloatValue($value) {
+  if (is_int($value) || is_float($value)) {
+    return (float)$value;
+  }
+
+  if (is_string($value)) {
+    $trimmed = trim($value);
+    if ($trimmed === '') return null;
+    if (!preg_match('/^-?\d+(?:[\.,]\d+)?$/', $trimmed)) return null;
+    $normalized = str_replace(',', '.', $trimmed);
+    return (float)$normalized;
+  }
+
+  return null;
+}
+
+function formatNumberForLog($number, $decimals = 2) {
+  $formatted = number_format((float)$number, $decimals, '.', '');
+  return rtrim(rtrim($formatted, '0'), '.');
+}
+
 function addStockMetricCandidate(array &$candidates, $label, $value, $score) {
   $intValue = normalizeIntValue($value);
   if ($intValue === null) return;
@@ -734,6 +759,217 @@ function voExtractMetricDetails(array $row) {
   return [$metric, $fieldUsed];
 }
 
+function voCacheStockRow($skuBase, array $row) {
+  global $VO_STOCK_CACHE;
+  $key = canonicalSku($skuBase);
+  if ($key === '') {
+    return;
+  }
+  $VO_STOCK_CACHE[$key] = $row;
+}
+
+function voGetCachedStockRow($skuBase) {
+  global $VO_STOCK_CACHE;
+  $key = canonicalSku($skuBase);
+  if ($key === '') {
+    return null;
+  }
+  return $VO_STOCK_CACHE[$key] ?? null;
+}
+
+function voFormatPath(array $path) {
+  if (!$path) {
+    return '';
+  }
+
+  $segments = [];
+  foreach ($path as $segment) {
+    if (is_int($segment)) {
+      $segments[] = '[' . $segment . ']';
+    } elseif (is_string($segment) && $segment !== '') {
+      $segments[] = $segment;
+    }
+  }
+
+  if (!$segments) {
+    return '';
+  }
+
+  $formatted = array_shift($segments);
+  foreach ($segments as $segment) {
+    if ($segment !== '' && $segment[0] === '[') {
+      $formatted .= $segment;
+    } else {
+      $formatted .= '.' . $segment;
+    }
+  }
+
+  return $formatted;
+}
+
+function voFindField($data, $targetKey) {
+  $target = strtolower((string)$targetKey);
+  if ($target === '') {
+    return null;
+  }
+
+  $stack = [[
+    'value' => $data,
+    'path'  => []
+  ]];
+  $visitedObjects = [];
+
+  while ($stack) {
+    $current = array_pop($stack);
+    $value = $current['value'];
+    $path  = $current['path'];
+
+    if (is_array($value)) {
+      foreach ($value as $key => $child) {
+        $newPath = $path;
+        if (is_string($key) || is_int($key)) {
+          $newPath[] = $key;
+        }
+        if (is_string($key) && strtolower($key) === $target) {
+          return ['value' => $child, 'path' => $newPath];
+        }
+        if (is_array($child) || is_object($child)) {
+          $stack[] = ['value' => $child, 'path' => $newPath];
+        }
+      }
+      continue;
+    }
+
+    if (is_object($value)) {
+      $objectId = spl_object_id($value);
+      if (isset($visitedObjects[$objectId])) {
+        continue;
+      }
+      $visitedObjects[$objectId] = true;
+
+      foreach (get_object_vars($value) as $key => $child) {
+        $newPath = $path;
+        $newPath[] = $key;
+        if (is_string($key) && strtolower($key) === $target) {
+          return ['value' => $child, 'path' => $newPath];
+        }
+        if (is_array($child) || is_object($child)) {
+          $stack[] = ['value' => $child, 'path' => $newPath];
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function voExtractSalesVelocityInfo(array $row) {
+  $definitions = [
+    ['keys' => ['weighting_sales_last_30_days', 'weighted_sales_last_30_days', 'fbm_weighting_sales_last_30_days'], 'days' => 30, 'per_day' => true],
+    ['keys' => ['sales_last_30_days', 'fbm_sales_last_30_days', 'sales_last_30_days_manual'], 'days' => 30, 'per_day' => false],
+    ['keys' => ['weighting_sales_last_14_days', 'weighted_sales_last_14_days', 'fbm_weighting_sales_last_14_days'], 'days' => 14, 'per_day' => true],
+    ['keys' => ['sales_last_14_days', 'fbm_sales_last_14_days'], 'days' => 14, 'per_day' => false],
+    ['keys' => ['weighting_sales_last_7_days', 'weighted_sales_last_7_days', 'fbm_weighting_sales_last_7_days'], 'days' => 7, 'per_day' => true],
+    ['keys' => ['sales_last_7_days', 'fbm_sales_last_7_days'], 'days' => 7, 'per_day' => false],
+    ['keys' => ['weighting_sales_last_3_days', 'weighted_sales_last_3_days', 'fbm_weighting_sales_last_3_days'], 'days' => 3, 'per_day' => true],
+    ['keys' => ['sales_last_3_days', 'fbm_sales_last_3_days'], 'days' => 3, 'per_day' => false],
+    ['keys' => ['avg_daily_sales', 'average_daily_sales', 'avg_sales_per_day', 'avg_daily_velocity', 'daily_sales'], 'days' => BILLBEE_VELOCITY_LOOKBACK_DAYS, 'per_day' => true],
+    ['keys' => ['sales_velocity', 'velocity_per_day', 'sales_velocity_per_day'], 'days' => BILLBEE_VELOCITY_LOOKBACK_DAYS, 'per_day' => true],
+  ];
+
+  $candidates = [];
+
+  foreach ($definitions as $definition) {
+    foreach ($definition['keys'] as $key) {
+      $found = voFindField($row, $key);
+      if ($found === null) {
+        continue;
+      }
+
+      $rawValue = normalizeFloatValue($found['value']);
+      if ($rawValue === null || $rawValue < 0) {
+        continue;
+      }
+
+      $window = (int)($definition['days'] ?? BILLBEE_VELOCITY_LOOKBACK_DAYS);
+      if ($window <= 0) {
+        $window = 1;
+      }
+      $daily = $definition['per_day'] ? $rawValue : ($rawValue / max(1, $window));
+      $score = ($daily > 0 ? 100000 : 0) + $window;
+
+      $candidates[] = [
+        'daily_rate'   => $daily,
+        'window_days'  => $window,
+        'raw_value'    => $rawValue,
+        'source_field' => $key,
+        'source_path'  => voFormatPath($found['path']),
+        'per_day'      => $definition['per_day'],
+        'score'        => $score,
+      ];
+
+      continue 2;
+    }
+  }
+
+  if (!$candidates) {
+    return null;
+  }
+
+  usort($candidates, function ($a, $b) {
+    if ($a['score'] === $b['score']) {
+      if ($a['daily_rate'] === $b['daily_rate']) {
+        return strcmp($a['source_field'], $b['source_field']);
+      }
+      return $b['daily_rate'] <=> $a['daily_rate'];
+    }
+    return $b['score'] <=> $a['score'];
+  });
+
+  $best = $candidates[0];
+
+  return [
+    'daily_rate'   => $best['daily_rate'],
+    'window_days'  => $best['window_days'],
+    'raw_value'    => $best['raw_value'],
+    'source_field' => $best['source_field'],
+    'source_path'  => $best['source_path'],
+    'per_day'      => $best['per_day'],
+  ];
+}
+
+function voResolveSalesVelocity($csvSku) {
+  global $VO_VELOCITY_CACHE;
+
+  $skuBase = normalizeVoSku($csvSku);
+  $cacheKey = canonicalSku($skuBase);
+  if ($cacheKey === '') {
+    return null;
+  }
+
+  if (array_key_exists($cacheKey, $VO_VELOCITY_CACHE)) {
+    return $VO_VELOCITY_CACHE[$cacheKey];
+  }
+
+  $row = voGetCachedStockRow($skuBase);
+  if ($row === null) {
+    $note = null;
+    $row = voFetchStockEntry($skuBase, $note);
+    if (!$row) {
+      $VO_VELOCITY_CACHE[$cacheKey] = null;
+      return null;
+    }
+  }
+
+  $info = voExtractSalesVelocityInfo($row);
+  if ($info !== null) {
+    $info['category'] = billbeeClassifyDailyRate($info['daily_rate']);
+  }
+
+  $VO_VELOCITY_CACHE[$cacheKey] = $info;
+  return $info;
+}
+
 function voFetchStockEntry($skuBase, &$note = null) {
   $headers = [
     'Authorization: Bearer ' . VO_TOKEN,
@@ -839,6 +1075,7 @@ function voFetchStockEntry($skuBase, &$note = null) {
           continue;
         }
 
+        voCacheStockRow($skuBase, $row);
         return $row;
       }
 
@@ -863,6 +1100,7 @@ function voFetchStockEntry($skuBase, &$note = null) {
     if ($fallbackNote !== null) {
       $note = $fallbackNote;
     }
+    voCacheStockRow($skuBase, $fallbackRow);
     return $fallbackRow;
   }
 
@@ -1171,8 +1409,10 @@ if (!empty($billbeeVelocityData['ok'])) {
   $billbeeVelocityInfo = [];
 }
 
-$billbeeCategoryCounters = ['fast' => 0, 'medium' => 0, 'slow' => 0, 'fallback' => 0];
+$billbeeCategoryCounters = ['fast' => 0, 'medium' => 0, 'slow' => 0];
+$billbeeSourceCounters = ['billbee' => 0, 'ventoryone' => 0, 'default' => 0];
 $billbeeVelocityLogCount = 0;
+$voVelocityLogCount = 0;
 $billbeeFallbackLogCount = 0;
 
 $okVO = 0; $failVO = 0; $okBB = 0; $failBB = 0;
@@ -1185,28 +1425,58 @@ foreach ($rows as $r) {
   if (updateVentoryTotal($csvSku, $stock)) $okVO++; else $failVO++;
 
   // --- Billbee: safety stock logic ---
+  $category = BILLBEE_DEFAULT_CATEGORY;
+  $source = 'default';
+
   $velocityInfo = billbeeResolveVelocityForSku($csvSku, $billbeeVelocityInfo);
-  if ($velocityInfo === null) {
-    $category = BILLBEE_DEFAULT_CATEGORY;
-    $billbeeCategoryCounters['fallback']++;
-    $billbeeCategoryCounters[$category]++;
-    if ($billbeeFallbackLogCount < 5) {
-      logMsg('ℹ️ Billbee velocity fallback for ' . $csvSku . ' → category=' . $category);
-      $billbeeFallbackLogCount++;
-    }
-  } else {
+  if ($velocityInfo !== null) {
     $category = $velocityInfo['category'];
-    if (!isset($billbeeCategoryCounters[$category])) {
-      $billbeeCategoryCounters[$category] = 0;
-    }
-    $billbeeCategoryCounters[$category]++;
+    $source = 'billbee';
     if ($billbeeVelocityLogCount < 5) {
       $keep = billbeeBufferForCategory($category);
-      $daily = number_format($velocityInfo['daily_rate'], 2);
+      $daily = formatNumberForLog($velocityInfo['daily_rate'] ?? 0);
       logMsg("ℹ️ Billbee velocity $csvSku → $category (avg $daily/day, keep $keep)");
       $billbeeVelocityLogCount++;
     }
+  } else {
+    $voVelocity = voResolveSalesVelocity($csvSku);
+    if ($voVelocity !== null) {
+      $category = $voVelocity['category'];
+      $source = 'ventoryone';
+      if ($voVelocityLogCount < 5) {
+        $keep = billbeeBufferForCategory($category);
+        $daily = formatNumberForLog($voVelocity['daily_rate'] ?? 0);
+        $raw = formatNumberForLog($voVelocity['raw_value'] ?? ($voVelocity['daily_rate'] ?? 0));
+        $window = $voVelocity['window_days'] ?? BILLBEE_VELOCITY_LOOKBACK_DAYS;
+        $sourceField = $voVelocity['source_field'] ?? 'vo';
+        if (!empty($voVelocity['per_day'])) {
+          $sourceDetail = $sourceField . '=' . $raw . '/day';
+        } else {
+          $sourceDetail = $sourceField . '=' . $raw . ' over ' . (int)$window . 'd';
+        }
+        $sourcePath = $voVelocity['source_path'] ?? '';
+        if ($sourcePath !== '' && strcasecmp($sourcePath, $sourceField) !== 0) {
+          $sourceDetail .= ' @ ' . $sourcePath;
+        }
+        logMsg("ℹ️ VentoryOne velocity $csvSku → $category (avg $daily/day, keep $keep, source $sourceDetail)");
+        $voVelocityLogCount++;
+      }
+    } else {
+      if ($billbeeFallbackLogCount < 5) {
+        logMsg('ℹ️ Billbee velocity fallback for ' . $csvSku . ' → category=' . $category . ' (no Billbee/VO data)');
+        $billbeeFallbackLogCount++;
+      }
+    }
   }
+
+  if (!isset($billbeeCategoryCounters[$category])) {
+    $billbeeCategoryCounters[$category] = 0;
+  }
+  $billbeeCategoryCounters[$category]++;
+  if (!isset($billbeeSourceCounters[$source])) {
+    $billbeeSourceCounters[$source] = 0;
+  }
+  $billbeeSourceCounters[$source]++;
 
   $bbQty = adjustStockForBillbee($stock, $category);
   $bbAllOk = true;
@@ -1223,13 +1493,20 @@ foreach ($rows as $r) {
 }
 
 $usedSummary = sprintf(
-  '📊 Billbee categories used this run → fast=%d, medium=%d, slow=%d, fallback=%d',
+  '📊 Billbee categories used this run → fast=%d, medium=%d, slow=%d',
   $billbeeCategoryCounters['fast'] ?? 0,
   $billbeeCategoryCounters['medium'] ?? 0,
-  $billbeeCategoryCounters['slow'] ?? 0,
-  $billbeeCategoryCounters['fallback'] ?? 0
+  $billbeeCategoryCounters['slow'] ?? 0
 );
 logMsg($usedSummary);
+
+$sourceSummary = sprintf(
+  '📊 Velocity sources → Billbee=%d, VentoryOne=%d, default=%d',
+  $billbeeSourceCounters['billbee'] ?? 0,
+  $billbeeSourceCounters['ventoryone'] ?? 0,
+  $billbeeSourceCounters['default'] ?? 0
+);
+logMsg($sourceSummary);
 
 logMsg("✅ Done. VO OK: $okVO/$count | VO Fail: $failVO/$count | Billbee OK: $okBB/$count | Billbee Fail: $failBB/$count");
 
