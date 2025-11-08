@@ -1387,11 +1387,14 @@ logMsg("📦 Found $count SKUs in stock file");
 
 $billbeeVelocityData = billbeeFetchSalesVelocities(BILLBEE_VELOCITY_LOOKBACK_DAYS);
 $billbeeVelocityInfo = $billbeeVelocityData['info'] ?? [];
-if (!empty($billbeeVelocityData['ok'])) {
+$billbeeVelocityWindow = $billbeeVelocityData['window_days'] ?? BILLBEE_VELOCITY_LOOKBACK_DAYS;
+$billbeeVelocityOk = !empty($billbeeVelocityData['ok']);
+$billbeeVelocityError = null;
+if ($billbeeVelocityOk) {
   $counts = $billbeeVelocityData['counts'] ?? ['fast' => 0, 'medium' => 0, 'slow' => 0];
   $summary = sprintf(
     '📈 Billbee sales velocity %dd → orders=%d, items=%d, tracked SKUs=%d | fast=%d, medium=%d, slow=%d',
-    $billbeeVelocityData['window_days'] ?? BILLBEE_VELOCITY_LOOKBACK_DAYS,
+    $billbeeVelocityWindow,
     $billbeeVelocityData['orders'] ?? 0,
     $billbeeVelocityData['items'] ?? 0,
     count($billbeeVelocityInfo),
@@ -1404,16 +1407,13 @@ if (!empty($billbeeVelocityData['ok'])) {
     logMsg('⚠️ Billbee velocity may be truncated due to page limit');
   }
 } else {
-  $error = $billbeeVelocityData['error'] ?? 'unknown error';
-  logMsg('⚠️ Billbee velocity data unavailable: ' . $error);
+  $billbeeVelocityError = $billbeeVelocityData['error'] ?? 'unknown error';
+  logMsg('⚠️ Billbee velocity data unavailable: ' . $billbeeVelocityError);
   $billbeeVelocityInfo = [];
 }
 
 $billbeeCategoryCounters = ['fast' => 0, 'medium' => 0, 'slow' => 0];
 $billbeeSourceCounters = ['billbee' => 0, 'ventoryone' => 0, 'default' => 0];
-$billbeeVelocityLogCount = 0;
-$voVelocityLogCount = 0;
-$billbeeFallbackLogCount = 0;
 
 $okVO = 0; $failVO = 0; $okBB = 0; $failBB = 0;
 
@@ -1427,47 +1427,79 @@ foreach ($rows as $r) {
   // --- Billbee: safety stock logic ---
   $category = BILLBEE_DEFAULT_CATEGORY;
   $source = 'default';
+  $velocityLogContext = ['type' => 'default'];
 
   $velocityInfo = billbeeResolveVelocityForSku($csvSku, $billbeeVelocityInfo);
   if ($velocityInfo !== null) {
     $category = $velocityInfo['category'];
     $source = 'billbee';
-    if ($billbeeVelocityLogCount < 5) {
-      $keep = billbeeBufferForCategory($category);
-      $daily = formatNumberForLog($velocityInfo['daily_rate'] ?? 0);
-      logMsg("ℹ️ Billbee velocity $csvSku → $category (avg $daily/day, keep $keep)");
-      $billbeeVelocityLogCount++;
-    }
+    $velocityLogContext = [
+      'type'   => 'billbee',
+      'daily'  => formatNumberForLog($velocityInfo['daily_rate'] ?? 0),
+      'total'  => $velocityInfo['total_quantity'] ?? null,
+      'window' => $billbeeVelocityWindow,
+    ];
   } else {
     $voVelocity = voResolveSalesVelocity($csvSku);
     if ($voVelocity !== null) {
       $category = $voVelocity['category'];
       $source = 'ventoryone';
-      if ($voVelocityLogCount < 5) {
-        $keep = billbeeBufferForCategory($category);
-        $daily = formatNumberForLog($voVelocity['daily_rate'] ?? 0);
-        $raw = formatNumberForLog($voVelocity['raw_value'] ?? ($voVelocity['daily_rate'] ?? 0));
-        $window = $voVelocity['window_days'] ?? BILLBEE_VELOCITY_LOOKBACK_DAYS;
-        $sourceField = $voVelocity['source_field'] ?? 'vo';
-        if (!empty($voVelocity['per_day'])) {
-          $sourceDetail = $sourceField . '=' . $raw . '/day';
-        } else {
-          $sourceDetail = $sourceField . '=' . $raw . ' over ' . (int)$window . 'd';
-        }
-        $sourcePath = $voVelocity['source_path'] ?? '';
-        if ($sourcePath !== '' && strcasecmp($sourcePath, $sourceField) !== 0) {
-          $sourceDetail .= ' @ ' . $sourcePath;
-        }
-        logMsg("ℹ️ VentoryOne velocity $csvSku → $category (avg $daily/day, keep $keep, source $sourceDetail)");
-        $voVelocityLogCount++;
-      }
+      $velocityLogContext = [
+        'type'        => 'ventoryone',
+        'daily'       => formatNumberForLog($voVelocity['daily_rate'] ?? 0),
+        'raw'         => formatNumberForLog($voVelocity['raw_value'] ?? ($voVelocity['daily_rate'] ?? 0)),
+        'window'      => (int)($voVelocity['window_days'] ?? BILLBEE_VELOCITY_LOOKBACK_DAYS),
+        'sourceField' => $voVelocity['source_field'] ?? 'vo',
+        'sourcePath'  => $voVelocity['source_path'] ?? '',
+        'perDay'      => !empty($voVelocity['per_day']),
+      ];
     } else {
-      if ($billbeeFallbackLogCount < 5) {
-        logMsg('ℹ️ Billbee velocity fallback for ' . $csvSku . ' → category=' . $category . ' (no Billbee/VO data)');
-        $billbeeFallbackLogCount++;
-      }
+      $reason = $billbeeVelocityOk
+        ? 'no Billbee velocity match in last ' . $billbeeVelocityWindow . 'd'
+        : 'Billbee velocity unavailable (' . $billbeeVelocityError . ')';
+      $velocityLogContext = [
+        'type'   => 'default',
+        'reason' => $reason,
+      ];
     }
   }
+
+  $keep = billbeeBufferForCategory($category);
+  $bbQty = adjustStockForBillbee($stock, $category);
+
+  switch ($velocityLogContext['type']) {
+    case 'billbee':
+      $total = $velocityLogContext['total'];
+      $window = (int)$velocityLogContext['window'];
+      if ($total !== null) {
+        $detail = 'sold=' . $total . ' over ' . $window . 'd';
+      } else {
+        $detail = 'window=' . $window . 'd';
+      }
+      logMsg("ℹ️ Billbee velocity $csvSku → $category (avg {$velocityLogContext['daily']}/day, $detail, keep $keep)");
+      break;
+    case 'ventoryone':
+      $sourceField = $velocityLogContext['sourceField'];
+      $raw = $velocityLogContext['raw'];
+      $window = $velocityLogContext['window'];
+      if (!empty($velocityLogContext['perDay'])) {
+        $sourceDetail = $sourceField . '=' . $raw . '/day';
+      } else {
+        $sourceDetail = $sourceField . '=' . $raw . ' over ' . (int)$window . 'd';
+      }
+      $sourcePath = $velocityLogContext['sourcePath'];
+      if ($sourcePath !== '' && strcasecmp($sourcePath, $sourceField) !== 0) {
+        $sourceDetail .= ' @ ' . $sourcePath;
+      }
+      logMsg("ℹ️ VentoryOne velocity $csvSku → $category (avg {$velocityLogContext['daily']}/day, keep $keep, source $sourceDetail)");
+      break;
+    default:
+      $reason = $velocityLogContext['reason'] ?? 'no velocity data';
+      logMsg('ℹ️ Billbee velocity fallback for ' . $csvSku . ' → category=' . $category . ' (keep ' . $keep . ', ' . $reason . ')');
+      break;
+  }
+
+  logMsg("ℹ️ Billbee allocation $csvSku → stock=$stock, keep=$keep, update=$bbQty, source=$source");
 
   if (!isset($billbeeCategoryCounters[$category])) {
     $billbeeCategoryCounters[$category] = 0;
@@ -1478,7 +1510,6 @@ foreach ($rows as $r) {
   }
   $billbeeSourceCounters[$source]++;
 
-  $bbQty = adjustStockForBillbee($stock, $category);
   $bbAllOk = true;
   foreach (billbeeSkuTargets($csvSku) as $bbSku) {
     if (!updateBillbee($bbSku, $bbQty)) {
