@@ -824,14 +824,14 @@ function voFetchStockEntry($skuBase, &$note = null) {
           $row['_matched_candidate'] = $skuDisplay;
         }
 
-        if ($warehouseIds) {
+        if (!empty($warehouseIds)) {
           $row['_warehouse_ids'] = $warehouseIds;
         }
 
         $row['_metric_field'] = $fieldUsed;
         $row['_metric_value'] = $metric;
 
-        if ($warehouseIds && !in_array(VO_WAREHOUSE_ID, $warehouseIds, true)) {
+        if (!empty($warehouseIds) && !in_array(VO_WAREHOUSE_ID, $warehouseIds, true)) {
           if ($fallbackRow === null) {
             $fallbackRow = $row;
             $fallbackNote = 'warehouse mismatch (found ' . implode(',', $warehouseIds) . ')';
@@ -1232,3 +1232,126 @@ $usedSummary = sprintf(
 logMsg($usedSummary);
 
 logMsg("✅ Done. VO OK: $okVO/$count | VO Fail: $failVO/$count | Billbee OK: $okBB/$count | Billbee Fail: $failBB/$count");
+
+/* ================= NOTIFICATION (SMTP over STARTTLS, only on failures) =================== */
+if ($failVO > 0 || $failBB > 0) {
+  // ---- Mail settings (from your message) ----
+  $mailer_from_name  = 'Marco Winter';
+  $mailer_from_email = 'info@feela.de';
+  $mailer_transport  = 'smtp'; // informational
+  $mailer_host       = 'w017b812.kasserver.com';
+  $mailer_port       = 587; // STARTTLS
+  $mailer_user       = 'news@feela.de';
+  $mailer_password   = 'zfv3myg.QEA5ruj0vhq';
+
+  $to_email = 'info@feela.de'; // change/add more recipients if needed
+
+  $subject = "⚠️ Inventory Sync Failures on " . date('Y-m-d H:i');
+  $htmlBody = "<h2>Inventory Sync Report</h2>"
+            . "<p><b>Date:</b> " . date('Y-m-d H:i:s') . "</p>"
+            . "<p><b>VentoryOne:</b> $okVO OK / $failVO Fail</p>"
+            . "<p><b>Billbee:</b> $okBB OK / $failBB Fail</p>"
+            . "<p>See attached log for details.</p>";
+
+  $attachmentPath = LOG_FILE;
+
+  // ---- Helper: read full SMTP response (supports multi-line 250- style) ----
+  $smtp_read = function($socket) {
+    $data = '';
+    while (($line = fgets($socket, 515)) !== false) {
+      $data .= $line;
+      // If the fourth char is space, it's the last line (e.g., "250 OK")
+      if (strlen($line) >= 4 && $line[3] === ' ') break;
+    }
+    return $data;
+  };
+
+  // ---- Build MIME message with optional attachment ----
+  $boundary = 'bnd_' . bin2hex(random_bytes(8));
+  $headers  = "From: " . addslashes($mailer_from_name) . " <{$mailer_from_email}>\r\n";
+  $headers .= "MIME-Version: 1.0\r\n";
+  $headers .= "Content-Type: multipart/mixed; boundary=\"{$boundary}\"\r\n";
+
+  $message  = "This is a MIME encoded message.\r\n\r\n";
+  $message .= "--{$boundary}\r\n";
+  $message .= "Content-Type: text/html; charset=\"UTF-8\"\r\n";
+  $message .= "Content-Transfer-Encoding: 7bit\r\n\r\n";
+  $message .= $htmlBody . "\r\n\r\n";
+
+  if (is_file($attachmentPath) && is_readable($attachmentPath)) {
+    $fileData  = chunk_split(base64_encode(file_get_contents($attachmentPath)));
+    $filename  = basename($attachmentPath);
+    $message .= "--{$boundary}\r\n";
+    $message .= "Content-Type: text/plain; name=\"{$filename}\"\r\n";
+    $message .= "Content-Transfer-Encoding: base64\r\n";
+    $message .= "Content-Disposition: attachment; filename=\"{$filename}\"\r\n\r\n";
+    $message .= $fileData . "\r\n\r\n";
+  }
+  $message .= "--{$boundary}--\r\n";
+
+  // ---- SMTP send with STARTTLS ----
+  $socket = fsockopen($mailer_host, $mailer_port, $errno, $errstr, 20);
+  if (!$socket) {
+    logMsg("⚠️ SMTP connect failed: $errstr ($errno)");
+  } else {
+    $resp = $smtp_read($socket); // server greeting
+    fputs($socket, "EHLO all-inkl\r\n");
+    $resp = $smtp_read($socket);
+
+    // STARTTLS
+    fputs($socket, "STARTTLS\r\n");
+    $resp = $smtp_read($socket);
+    if (stripos($resp, '220') !== 0) {
+      // server may already require TLS or not support STARTTLS; try to continue
+      logMsg("⚠️ STARTTLS not accepted: " . trim($resp));
+    } else {
+      // enable TLS encryption
+      $cryptoOk = stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLS_CLIENT);
+      if (!$cryptoOk) {
+        logMsg("⚠️ Failed to enable TLS crypto");
+      } else {
+        // EHLO again after STARTTLS
+        fputs($socket, "EHLO all-inkl\r\n");
+        $resp = $smtp_read($socket);
+      }
+    }
+
+    // AUTH LOGIN
+    fputs($socket, "AUTH LOGIN\r\n");
+    $resp = $smtp_read($socket);
+    fputs($socket, base64_encode($mailer_user) . "\r\n");
+    $resp = $smtp_read($socket);
+    fputs($socket, base64_encode($mailer_password) . "\r\n");
+    $resp = $smtp_read($socket);
+
+    // MAIL FROM / RCPT TO / DATA
+    fputs($socket, "MAIL FROM:<{$mailer_from_email}>\r\n");
+    $resp = $smtp_read($socket);
+
+    // Support multiple recipients (comma-separated)
+    $recipients = array_map('trim', explode(',', $to_email));
+    foreach ($recipients as $rcpt) {
+      if ($rcpt === '') continue;
+      fputs($socket, "RCPT TO:<{$rcpt}>\r\n");
+      $resp = $smtp_read($socket);
+    }
+
+    fputs($socket, "DATA\r\n");
+    $resp = $smtp_read($socket);
+
+    // Headers (must include To + Subject inside DATA)
+    $toHeader = 'To: ' . implode(', ', $recipients) . "\r\n";
+    $subjectHeader = 'Subject: ' . $subject . "\r\n";
+
+    fputs($socket, $toHeader . $subjectHeader . $headers . "\r\n" . $message . "\r\n.\r\n");
+    $resp = $smtp_read($socket);
+
+    fputs($socket, "QUIT\r\n");
+    $smtp_read($socket);
+    fclose($socket);
+
+    logMsg("📧 Failure notification email sent to: " . implode(', ', $recipients));
+  }
+}
+
+?>
