@@ -1,6 +1,6 @@
 <?php
 /**
- * Inventory Sync (LIVE)
+ * Inventory Sync (LIVE / DRY-RUN)
  * - VentoryOne: set STK – Insgesamt to CSV total (cartons=0, loose=CSV)
  * - Billbee: apply safety deduction before update
  *
@@ -16,11 +16,16 @@ ini_set('display_errors', 0);
 $argv = $argv ?? [];
 $forceEcho  = false;
 $forceQuiet = false;
+$forcedMode = null;
 foreach (array_slice($argv, 1) as $arg) {
   if ($arg === '--verbose' || $arg === '-v') {
     $forceEcho = true;
   } elseif ($arg === '--quiet' || $arg === '-q') {
     $forceQuiet = true;
+  } elseif ($arg === '--dry-run' || $arg === '--dry') {
+    $forcedMode = 'dry';
+  } elseif ($arg === '--live') {
+    $forcedMode = 'live';
   }
 }
 
@@ -48,10 +53,26 @@ define('LOCAL_CSV_DIR', __DIR__ . '/csv_files');
 define('LOG_FILE', __DIR__ . '/sync_' . date('Ymd_His') . '.log');
 define('LOG_ECHO_ENABLED', $logEchoEnabled);
 
-// VentoryOne (2285 = cafol warehouse)
+// Toggle default sync mode here. Options: 'live' or 'dry'. Override via CLI (--dry-run / --live) or INVENTORY_SYNC_MODE env.
+define('SYNC_MODE_DEFAULT', 'live');
+
+$envMode = getenv('INVENTORY_SYNC_MODE');
+$mode = $forcedMode ?? ($envMode !== false ? $envMode : SYNC_MODE_DEFAULT);
+$mode = strtolower(trim((string)$mode));
+if ($mode === 'dry-run') {
+  $mode = 'dry';
+}
+if (!in_array($mode, ['live', 'dry'], true)) {
+  $mode = SYNC_MODE_DEFAULT;
+}
+
+define('SYNC_RUN_MODE', $mode);
+define('SYNC_DRY_RUN', SYNC_RUN_MODE !== 'live');
+
+// VentoryOne (2116 = cafol warehouse)
 define('VO_BASE', 'https://app.ventory.one');
 define('VO_TOKEN', '2d94eb4a8c3c2cef8ad628e3619591069b7156ed');
-define('VO_WAREHOUSE_ID', 2285);
+define('VO_WAREHOUSE_ID', 2116);
 
 // Billbee
 define('BILLBEE_API_URL', 'https://app.billbee.io/api/v1/');
@@ -85,6 +106,21 @@ function logMsg($msg) {
     echo $line;
   }
   file_put_contents(LOG_FILE, $line, FILE_APPEND);
+}
+
+function runModeLabel() {
+  return SYNC_DRY_RUN ? 'DRY-RUN' : 'LIVE';
+}
+
+function isDryRun() {
+  return SYNC_DRY_RUN;
+}
+
+function logSection($title) {
+  $bar = str_repeat('-', max(10, strlen($title) + 6));
+  logMsg($bar);
+  logMsg('>>> ' . $title);
+  logMsg($bar);
 }
 
 /* ============== HTTP with retry ============== */
@@ -436,16 +472,25 @@ function billbeeResolveVelocityForSku($sku, array $velocityInfo) {
 }
 
 /* ============ Helpers ============ */
+function isFbmSku($sku) {
+  if (!is_string($sku)) {
+    return false;
+  }
+
+  return preg_match('/-FBM$/i', trim($sku)) === 1;
+}
+
 function normalizeVoSku($sku) {
   // VentoryOne uses the base SKU (no "-FBM")
-  return preg_replace('/-FBM$/', '', $sku);
+  return preg_replace('/-FBM$/i', '', $sku);
 }
 
 function billbeeSkuTargets($sku) {
   $targets = [$sku];
 
-  // Billbee stores some SKUs without their fulfillment suffix (e.g. "-FBM" or "-FBA").
-  if (preg_match('/-(FB[AM])$/i', $sku, $m)) {
+  // Billbee previously stored some SKUs without their fulfillment suffix (e.g. "-FBM" or "-FBA").
+  // Only add the suffix-less variant for non-FBM SKUs – FBM stock must remain isolated.
+  if (preg_match('/-(FB[AM])$/i', $sku, $m) && strcasecmp($m[1], 'FBM') !== 0) {
     $base = substr($sku, 0, -strlen($m[0]));
     if ($base !== '') {
       $targets[] = $base;
@@ -982,7 +1027,6 @@ function voFetchStockEntry($skuBase, &$note = null) {
   ];
 
   $note = 'SKU not found in current_stock';
-  $fallbackRow = null;
   $fallbackNote = null;
 
   foreach ($attempts as $baseUrl) {
@@ -1068,8 +1112,7 @@ function voFetchStockEntry($skuBase, &$note = null) {
         $row['_metric_value'] = $metric;
 
         if (!empty($warehouseIds) && !in_array(VO_WAREHOUSE_ID, $warehouseIds, true)) {
-          if ($fallbackRow === null) {
-            $fallbackRow = $row;
+          if ($fallbackNote === null) {
             $fallbackNote = 'warehouse mismatch (found ' . implode(',', $warehouseIds) . ')';
           }
           continue;
@@ -1096,12 +1139,8 @@ function voFetchStockEntry($skuBase, &$note = null) {
     }
   }
 
-  if ($fallbackRow !== null) {
-    if ($fallbackNote !== null) {
-      $note = $fallbackNote;
-    }
-    voCacheStockRow($skuBase, $fallbackRow);
-    return $fallbackRow;
+  if ($fallbackNote !== null) {
+    $note = $fallbackNote;
   }
 
   return null;
@@ -1205,6 +1244,20 @@ function voPostAndCheck($path, array $payload) {
     'Accept: application/json'
   ];
 
+  if (isDryRun()) {
+    $skuList = [];
+    if (isset($payload['sku_qty_list']) && is_array($payload['sku_qty_list'])) {
+      foreach ($payload['sku_qty_list'] as $entry) {
+        if (is_array($entry)) {
+          $skuList[] = $entry['sku'] ?? ('#' . ($entry['sku_id'] ?? '?'));
+        }
+      }
+    }
+    $summary = $skuList ? implode(', ', $skuList) : 'n/a';
+    logMsg('🧪 DRY-RUN: VentoryOne ' . $path . ' would update [' . $summary . ']');
+    return [true, 'dry-run'];
+  }
+
   [$code, $resp, $curlErr, $verbose] = httpJsonWithRetry($url, 'POST', $headers, $payload);
 
   if (!($code >= 200 && $code < 300)) {
@@ -1244,6 +1297,21 @@ function voPostAndCheck($path, array $payload) {
 }
 
 /* ============ VentoryOne ============ */
+function voDescribeIdent(array $ident) {
+  $parts = [];
+  if (!empty($ident['sku'])) {
+    $parts[] = 'sku=' . $ident['sku'];
+  }
+  if (!empty($ident['sku_id'])) {
+    $parts[] = 'sku_id=' . $ident['sku_id'];
+  }
+  if (!empty($ident['organization_id'])) {
+    $parts[] = 'org=' . $ident['organization_id'];
+  }
+  $parts[] = 'warehouse=' . VO_WAREHOUSE_ID;
+  return implode(', ', $parts);
+}
+
 function voSetCartonsZero(array $ident) {
   $entry = ['carton_qty' => 0];
 
@@ -1260,6 +1328,11 @@ function voSetCartonsZero(array $ident) {
 
   if (!empty($ident['organization_id'])) {
     $payload['organization_id'] = (int)$ident['organization_id'];
+  }
+
+  if (isDryRun()) {
+    logMsg('🧪 DRY-RUN: skip VentoryOne carton reset for ' . voDescribeIdent($ident));
+    return [true, 'dry-run'];
   }
 
   return voPostAndCheck('/api/update_plain_carton_line_item_qty/', $payload);
@@ -1285,10 +1358,19 @@ function voSetLooseToTotal(array $ident, $total) {
     $payload['organization_id'] = (int)$ident['organization_id'];
   }
 
+  if (isDryRun()) {
+    logMsg('🧪 DRY-RUN: skip VentoryOne loose stock set to ' . (int)$total . ' for ' . voDescribeIdent($ident));
+    return [true, 'dry-run'];
+  }
+
   return voPostAndCheck('/api/update_loose_stock/', $payload);
 }
 
 function voVerifyLooseEquals($skuBase, $expect) {
+  if (isDryRun()) {
+    return [true, 'dry-run'];
+  }
+
   $note = null;
   $row = voFetchStockEntry($skuBase, $note);
   if (!$row) {
@@ -1343,6 +1425,11 @@ function updateVentoryTotal($csvSku, $total) {
   }
 
   if ($okC && $okL) {
+    if (isDryRun()) {
+      logMsg("🧪 DRY-RUN: VentoryOne would set $skuBase → STK–Insgesamt=$total (cartons=0, loose=$total)");
+      return true;
+    }
+
     // verify (after async processing it may take a moment; still try once)
     [$okV, $note] = voVerifyLooseEquals($skuBase, $total);
     if ($okV) {
@@ -1366,6 +1453,12 @@ function updateBillbee($sku, $qty) {
     'NewQuantity' => (int)$qty,
     'Reason'      => 'Automated sync via Feela'
   ];
+
+  if (isDryRun()) {
+    logMsg('🧪 DRY-RUN: skip Billbee stock update for ' . $sku . ' → ' . (int)$qty);
+    return true;
+  }
+
   [$code, $resp] = httpJsonWithRetry($url, 'POST', $headers, $payload);
 
   if ($code >= 200 && $code < 300) {
@@ -1378,13 +1471,30 @@ function updateBillbee($sku, $qty) {
 }
 
 /* ================= MAIN =================== */
-logMsg("========== INVENTORY SYNC (LIVE) ==========");
+$heading = '========== INVENTORY SYNC (' . runModeLabel() . ') ==========';
+logMsg($heading);
+if (isDryRun()) {
+  logMsg('📋 Mode: DRY-RUN → external services will NOT be updated.');
+} else {
+  logMsg('📋 Mode: LIVE → external services WILL be updated.');
+}
+logMsg('🏬 VentoryOne warehouse target: ' . VO_WAREHOUSE_ID . ' (CAFOL)');
+logMsg('🎯 SKU filter: only items ending with -FBM are processed');
+logMsg('⏱️ Billbee velocity lookback: ' . BILLBEE_VELOCITY_LOOKBACK_DAYS . ' days');
+
+logSection('CSV IMPORT');
 $csv  = downloadLatestCSV();
 $rows = parseCSV($csv);
 
 $count = count($rows);
 logMsg("📦 Found $count SKUs in stock file");
 
+$fbmCount = count(array_filter($rows, function ($row) {
+  return isset($row['sku']) && isFbmSku($row['sku']);
+}));
+logMsg('📦 FBM-qualified SKUs detected: ' . $fbmCount);
+
+logSection('BILLBEE SALES VELOCITY');
 $billbeeVelocityData = billbeeFetchSalesVelocities(BILLBEE_VELOCITY_LOOKBACK_DAYS);
 $billbeeVelocityInfo = $billbeeVelocityData['info'] ?? [];
 $billbeeVelocityWindow = $billbeeVelocityData['window_days'] ?? BILLBEE_VELOCITY_LOOKBACK_DAYS;
@@ -1416,10 +1526,21 @@ $billbeeCategoryCounters = ['fast' => 0, 'medium' => 0, 'slow' => 0];
 $billbeeSourceCounters = ['billbee' => 0, 'ventoryone' => 0, 'default' => 0];
 
 $okVO = 0; $failVO = 0; $okBB = 0; $failBB = 0;
+$processedCount = 0;
+$skippedNonFbm = 0;
 
+logSection('SYNCHRONIZATION RUN');
 foreach ($rows as $r) {
   $csvSku = $r['sku'];
   $stock  = (int)$r['stock'];
+
+  if (!isFbmSku($csvSku)) {
+    $skippedNonFbm++;
+    logMsg('ℹ️ Skipping non-FBM SKU ' . $csvSku . ' (no stock update)');
+    continue;
+  }
+
+  $processedCount++;
 
   // --- VentoryOne: STK – Insgesamt = CSV total (cartons=0, loose=stock) ---
   if (updateVentoryTotal($csvSku, $stock)) $okVO++; else $failVO++;
@@ -1529,17 +1650,27 @@ $usedSummary = sprintf(
   $billbeeCategoryCounters['medium'] ?? 0,
   $billbeeCategoryCounters['slow'] ?? 0
 );
-logMsg($usedSummary);
-
 $sourceSummary = sprintf(
   '📊 Velocity sources → Billbee=%d, VentoryOne=%d, default=%d',
   $billbeeSourceCounters['billbee'] ?? 0,
   $billbeeSourceCounters['ventoryone'] ?? 0,
   $billbeeSourceCounters['default'] ?? 0
 );
+logSection('RUN SUMMARY');
+logMsg($usedSummary);
 logMsg($sourceSummary);
+logMsg(sprintf('📦 CSV totals → all SKUs=%d | FBM processed=%d | non-FBM skipped=%d', $count, $processedCount, $skippedNonFbm));
+logMsg(sprintf('🏬 VentoryOne → success=%d | failed=%d', $okVO, $failVO));
+logMsg(sprintf('🧾 Billbee → success=%d | failed=%d', $okBB, $failBB));
 
-logMsg("✅ Done. VO OK: $okVO/$count | VO Fail: $failVO/$count | Billbee OK: $okBB/$count | Billbee Fail: $failBB/$count");
+$finalLine = '✅ Run complete (' . runModeLabel() . '). VO OK: ' . $okVO . '/' . $processedCount
+           . ' | VO Fail: ' . $failVO . '/' . $processedCount
+           . ' | Billbee OK: ' . $okBB . '/' . $processedCount
+           . ' | Billbee Fail: ' . $failBB . '/' . $processedCount;
+logMsg($finalLine);
+if ($skippedNonFbm > 0) {
+  logMsg('ℹ️ Skipped non-FBM SKUs: ' . $skippedNonFbm);
+}
 
 /* ================= NOTIFICATION (SMTP over STARTTLS, only on failures) =================== */
 if ($failVO > 0 || $failBB > 0) {
