@@ -53,22 +53,6 @@ define('LOCAL_CSV_DIR', __DIR__ . '/csv_files');
 define('LOG_FILE', __DIR__ . '/sync_' . date('Ymd_His') . '.log');
 define('LOG_ECHO_ENABLED', $logEchoEnabled);
 
-// Toggle default sync mode here. Options: 'live' or 'dry'. Override via CLI (--dry-run / --live) or INVENTORY_SYNC_MODE env.
-define('SYNC_MODE_DEFAULT', 'live');
-
-$envMode = getenv('INVENTORY_SYNC_MODE');
-$mode = $forcedMode ?? ($envMode !== false ? $envMode : SYNC_MODE_DEFAULT);
-$mode = strtolower(trim((string)$mode));
-if ($mode === 'dry-run') {
-  $mode = 'dry';
-}
-if (!in_array($mode, ['live', 'dry'], true)) {
-  $mode = SYNC_MODE_DEFAULT;
-}
-
-define('SYNC_RUN_MODE', $mode);
-define('SYNC_DRY_RUN', SYNC_RUN_MODE !== 'live');
-
 // VentoryOne (2116 = cafol warehouse)
 define('VO_BASE', 'https://app.ventory.one');
 define('VO_TOKEN', '2d94eb4a8c3c2cef8ad628e3619591069b7156ed');
@@ -1659,15 +1643,8 @@ $sourceSummary = sprintf(
 logSection('RUN SUMMARY');
 logMsg($usedSummary);
 logMsg($sourceSummary);
-logMsg(sprintf('📦 CSV totals → all SKUs=%d | FBM processed=%d | non-FBM skipped=%d', $count, $processedCount, $skippedNonFbm));
-logMsg(sprintf('🏬 VentoryOne → success=%d | failed=%d', $okVO, $failVO));
-logMsg(sprintf('🧾 Billbee → success=%d | failed=%d', $okBB, $failBB));
 
-$finalLine = '✅ Run complete (' . runModeLabel() . '). VO OK: ' . $okVO . '/' . $processedCount
-           . ' | VO Fail: ' . $failVO . '/' . $processedCount
-           . ' | Billbee OK: ' . $okBB . '/' . $processedCount
-           . ' | Billbee Fail: ' . $failBB . '/' . $processedCount;
-logMsg($finalLine);
+logMsg("✅ Done. VO OK: $okVO/$processedCount | VO Fail: $failVO/$processedCount | Billbee OK: $okBB/$processedCount | Billbee Fail: $failBB/$processedCount");
 if ($skippedNonFbm > 0) {
   logMsg('ℹ️ Skipped non-FBM SKUs: ' . $skippedNonFbm);
 }
