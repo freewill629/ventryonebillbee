@@ -29,7 +29,7 @@ foreach (array_slice($argv, 1) as $arg) {
   }
 }
 
-$runMode = $forcedMode ?? 'dry';
+$runMode = $forcedMode ?? 'live';
 define('SYNC_DRY_RUN', $runMode !== 'live');
 
 $defaultEcho = true;
