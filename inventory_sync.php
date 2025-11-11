@@ -29,6 +29,9 @@ foreach (array_slice($argv, 1) as $arg) {
   }
 }
 
+$runMode = $forcedMode ?? 'dry';
+define('SYNC_DRY_RUN', $runMode !== 'live');
+
 $defaultEcho = true;
 $envEcho = getenv('INVENTORY_SYNC_STDOUT');
 if ($envEcho !== false) {
