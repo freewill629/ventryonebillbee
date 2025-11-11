@@ -48,10 +48,10 @@ define('LOCAL_CSV_DIR', __DIR__ . '/csv_files');
 define('LOG_FILE', __DIR__ . '/sync_' . date('Ymd_His') . '.log');
 define('LOG_ECHO_ENABLED', $logEchoEnabled);
 
-// VentoryOne (2285 = cafol warehouse)
+// VentoryOne (2116 = cafol warehouse)
 define('VO_BASE', 'https://app.ventory.one');
 define('VO_TOKEN', '2d94eb4a8c3c2cef8ad628e3619591069b7156ed');
-define('VO_WAREHOUSE_ID', 2285);
+define('VO_WAREHOUSE_ID', 2116);
 
 // Billbee
 define('BILLBEE_API_URL', 'https://app.billbee.io/api/v1/');
@@ -436,16 +436,25 @@ function billbeeResolveVelocityForSku($sku, array $velocityInfo) {
 }
 
 /* ============ Helpers ============ */
+function isFbmSku($sku) {
+  if (!is_string($sku)) {
+    return false;
+  }
+
+  return preg_match('/-FBM$/i', trim($sku)) === 1;
+}
+
 function normalizeVoSku($sku) {
   // VentoryOne uses the base SKU (no "-FBM")
-  return preg_replace('/-FBM$/', '', $sku);
+  return preg_replace('/-FBM$/i', '', $sku);
 }
 
 function billbeeSkuTargets($sku) {
   $targets = [$sku];
 
-  // Billbee stores some SKUs without their fulfillment suffix (e.g. "-FBM" or "-FBA").
-  if (preg_match('/-(FB[AM])$/i', $sku, $m)) {
+  // Billbee previously stored some SKUs without their fulfillment suffix (e.g. "-FBM" or "-FBA").
+  // Only add the suffix-less variant for non-FBM SKUs – FBM stock must remain isolated.
+  if (preg_match('/-(FB[AM])$/i', $sku, $m) && strcasecmp($m[1], 'FBM') !== 0) {
     $base = substr($sku, 0, -strlen($m[0]));
     if ($base !== '') {
       $targets[] = $base;
@@ -982,7 +991,6 @@ function voFetchStockEntry($skuBase, &$note = null) {
   ];
 
   $note = 'SKU not found in current_stock';
-  $fallbackRow = null;
   $fallbackNote = null;
 
   foreach ($attempts as $baseUrl) {
@@ -1068,8 +1076,7 @@ function voFetchStockEntry($skuBase, &$note = null) {
         $row['_metric_value'] = $metric;
 
         if (!empty($warehouseIds) && !in_array(VO_WAREHOUSE_ID, $warehouseIds, true)) {
-          if ($fallbackRow === null) {
-            $fallbackRow = $row;
+          if ($fallbackNote === null) {
             $fallbackNote = 'warehouse mismatch (found ' . implode(',', $warehouseIds) . ')';
           }
           continue;
@@ -1096,12 +1103,8 @@ function voFetchStockEntry($skuBase, &$note = null) {
     }
   }
 
-  if ($fallbackRow !== null) {
-    if ($fallbackNote !== null) {
-      $note = $fallbackNote;
-    }
-    voCacheStockRow($skuBase, $fallbackRow);
-    return $fallbackRow;
+  if ($fallbackNote !== null) {
+    $note = $fallbackNote;
   }
 
   return null;
@@ -1416,10 +1419,20 @@ $billbeeCategoryCounters = ['fast' => 0, 'medium' => 0, 'slow' => 0];
 $billbeeSourceCounters = ['billbee' => 0, 'ventoryone' => 0, 'default' => 0];
 
 $okVO = 0; $failVO = 0; $okBB = 0; $failBB = 0;
+$processedCount = 0;
+$skippedNonFbm = 0;
 
 foreach ($rows as $r) {
   $csvSku = $r['sku'];
   $stock  = (int)$r['stock'];
+
+  if (!isFbmSku($csvSku)) {
+    $skippedNonFbm++;
+    logMsg('ℹ️ Skipping non-FBM SKU ' . $csvSku . ' (no stock update)');
+    continue;
+  }
+
+  $processedCount++;
 
   // --- VentoryOne: STK – Insgesamt = CSV total (cartons=0, loose=stock) ---
   if (updateVentoryTotal($csvSku, $stock)) $okVO++; else $failVO++;
@@ -1539,7 +1552,10 @@ $sourceSummary = sprintf(
 );
 logMsg($sourceSummary);
 
-logMsg("✅ Done. VO OK: $okVO/$count | VO Fail: $failVO/$count | Billbee OK: $okBB/$count | Billbee Fail: $failBB/$count");
+logMsg("✅ Done. VO OK: $okVO/$processedCount | VO Fail: $failVO/$processedCount | Billbee OK: $okBB/$processedCount | Billbee Fail: $failBB/$processedCount");
+if ($skippedNonFbm > 0) {
+  logMsg('ℹ️ Skipped non-FBM SKUs: ' . $skippedNonFbm);
+}
 
 /* ================= NOTIFICATION (SMTP over STARTTLS, only on failures) =================== */
 if ($failVO > 0 || $failBB > 0) {
