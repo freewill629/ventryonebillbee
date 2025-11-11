@@ -29,11 +29,15 @@ foreach (array_slice($argv, 1) as $arg) {
   }
 }
 
-$defaultEcho = false;
-if (getenv('INVENTORY_SYNC_STDOUT') === '1') {
-  $defaultEcho = true;
-} elseif (function_exists('posix_isatty') && defined('STDOUT')) {
-  $defaultEcho = @posix_isatty(STDOUT);
+$defaultEcho = true;
+$envEcho = getenv('INVENTORY_SYNC_STDOUT');
+if ($envEcho !== false) {
+  $envEcho = strtolower(trim($envEcho));
+  if (in_array($envEcho, ['0', 'false', 'no', 'off'], true)) {
+    $defaultEcho = false;
+  } else {
+    $defaultEcho = true;
+  }
 }
 
 $logEchoEnabled = $forceQuiet ? false : ($forceEcho ? true : $defaultEcho);
