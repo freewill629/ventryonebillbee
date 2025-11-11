@@ -1,6 +1,6 @@
 <?php
 /**
- * Inventory Sync (LIVE)
+ * Inventory Sync (LIVE / DRY-RUN)
  * - VentoryOne: set STK – Insgesamt to CSV total (cartons=0, loose=CSV)
  * - Billbee: apply safety deduction before update
  *
@@ -16,11 +16,16 @@ ini_set('display_errors', 0);
 $argv = $argv ?? [];
 $forceEcho  = false;
 $forceQuiet = false;
+$forcedMode = null;
 foreach (array_slice($argv, 1) as $arg) {
   if ($arg === '--verbose' || $arg === '-v') {
     $forceEcho = true;
   } elseif ($arg === '--quiet' || $arg === '-q') {
     $forceQuiet = true;
+  } elseif ($arg === '--dry-run' || $arg === '--dry') {
+    $forcedMode = 'dry';
+  } elseif ($arg === '--live') {
+    $forcedMode = 'live';
   }
 }
 
@@ -85,6 +90,21 @@ function logMsg($msg) {
     echo $line;
   }
   file_put_contents(LOG_FILE, $line, FILE_APPEND);
+}
+
+function runModeLabel() {
+  return SYNC_DRY_RUN ? 'DRY-RUN' : 'LIVE';
+}
+
+function isDryRun() {
+  return SYNC_DRY_RUN;
+}
+
+function logSection($title) {
+  $bar = str_repeat('-', max(10, strlen($title) + 6));
+  logMsg($bar);
+  logMsg('>>> ' . $title);
+  logMsg($bar);
 }
 
 /* ============== HTTP with retry ============== */
@@ -1208,6 +1228,20 @@ function voPostAndCheck($path, array $payload) {
     'Accept: application/json'
   ];
 
+  if (isDryRun()) {
+    $skuList = [];
+    if (isset($payload['sku_qty_list']) && is_array($payload['sku_qty_list'])) {
+      foreach ($payload['sku_qty_list'] as $entry) {
+        if (is_array($entry)) {
+          $skuList[] = $entry['sku'] ?? ('#' . ($entry['sku_id'] ?? '?'));
+        }
+      }
+    }
+    $summary = $skuList ? implode(', ', $skuList) : 'n/a';
+    logMsg('🧪 DRY-RUN: VentoryOne ' . $path . ' would update [' . $summary . ']');
+    return [true, 'dry-run'];
+  }
+
   [$code, $resp, $curlErr, $verbose] = httpJsonWithRetry($url, 'POST', $headers, $payload);
 
   if (!($code >= 200 && $code < 300)) {
@@ -1247,6 +1281,21 @@ function voPostAndCheck($path, array $payload) {
 }
 
 /* ============ VentoryOne ============ */
+function voDescribeIdent(array $ident) {
+  $parts = [];
+  if (!empty($ident['sku'])) {
+    $parts[] = 'sku=' . $ident['sku'];
+  }
+  if (!empty($ident['sku_id'])) {
+    $parts[] = 'sku_id=' . $ident['sku_id'];
+  }
+  if (!empty($ident['organization_id'])) {
+    $parts[] = 'org=' . $ident['organization_id'];
+  }
+  $parts[] = 'warehouse=' . VO_WAREHOUSE_ID;
+  return implode(', ', $parts);
+}
+
 function voSetCartonsZero(array $ident) {
   $entry = ['carton_qty' => 0];
 
@@ -1263,6 +1312,11 @@ function voSetCartonsZero(array $ident) {
 
   if (!empty($ident['organization_id'])) {
     $payload['organization_id'] = (int)$ident['organization_id'];
+  }
+
+  if (isDryRun()) {
+    logMsg('🧪 DRY-RUN: skip VentoryOne carton reset for ' . voDescribeIdent($ident));
+    return [true, 'dry-run'];
   }
 
   return voPostAndCheck('/api/update_plain_carton_line_item_qty/', $payload);
@@ -1288,10 +1342,19 @@ function voSetLooseToTotal(array $ident, $total) {
     $payload['organization_id'] = (int)$ident['organization_id'];
   }
 
+  if (isDryRun()) {
+    logMsg('🧪 DRY-RUN: skip VentoryOne loose stock set to ' . (int)$total . ' for ' . voDescribeIdent($ident));
+    return [true, 'dry-run'];
+  }
+
   return voPostAndCheck('/api/update_loose_stock/', $payload);
 }
 
 function voVerifyLooseEquals($skuBase, $expect) {
+  if (isDryRun()) {
+    return [true, 'dry-run'];
+  }
+
   $note = null;
   $row = voFetchStockEntry($skuBase, $note);
   if (!$row) {
@@ -1346,6 +1409,11 @@ function updateVentoryTotal($csvSku, $total) {
   }
 
   if ($okC && $okL) {
+    if (isDryRun()) {
+      logMsg("🧪 DRY-RUN: VentoryOne would set $skuBase → STK–Insgesamt=$total (cartons=0, loose=$total)");
+      return true;
+    }
+
     // verify (after async processing it may take a moment; still try once)
     [$okV, $note] = voVerifyLooseEquals($skuBase, $total);
     if ($okV) {
@@ -1369,6 +1437,12 @@ function updateBillbee($sku, $qty) {
     'NewQuantity' => (int)$qty,
     'Reason'      => 'Automated sync via Feela'
   ];
+
+  if (isDryRun()) {
+    logMsg('🧪 DRY-RUN: skip Billbee stock update for ' . $sku . ' → ' . (int)$qty);
+    return true;
+  }
+
   [$code, $resp] = httpJsonWithRetry($url, 'POST', $headers, $payload);
 
   if ($code >= 200 && $code < 300) {
@@ -1381,13 +1455,30 @@ function updateBillbee($sku, $qty) {
 }
 
 /* ================= MAIN =================== */
-logMsg("========== INVENTORY SYNC (LIVE) ==========");
+$heading = '========== INVENTORY SYNC (' . runModeLabel() . ') ==========';
+logMsg($heading);
+if (isDryRun()) {
+  logMsg('📋 Mode: DRY-RUN → external services will NOT be updated.');
+} else {
+  logMsg('📋 Mode: LIVE → external services WILL be updated.');
+}
+logMsg('🏬 VentoryOne warehouse target: ' . VO_WAREHOUSE_ID . ' (CAFOL)');
+logMsg('🎯 SKU filter: only items ending with -FBM are processed');
+logMsg('⏱️ Billbee velocity lookback: ' . BILLBEE_VELOCITY_LOOKBACK_DAYS . ' days');
+
+logSection('CSV IMPORT');
 $csv  = downloadLatestCSV();
 $rows = parseCSV($csv);
 
 $count = count($rows);
 logMsg("📦 Found $count SKUs in stock file");
 
+$fbmCount = count(array_filter($rows, function ($row) {
+  return isset($row['sku']) && isFbmSku($row['sku']);
+}));
+logMsg('📦 FBM-qualified SKUs detected: ' . $fbmCount);
+
+logSection('BILLBEE SALES VELOCITY');
 $billbeeVelocityData = billbeeFetchSalesVelocities(BILLBEE_VELOCITY_LOOKBACK_DAYS);
 $billbeeVelocityInfo = $billbeeVelocityData['info'] ?? [];
 $billbeeVelocityWindow = $billbeeVelocityData['window_days'] ?? BILLBEE_VELOCITY_LOOKBACK_DAYS;
@@ -1422,6 +1513,7 @@ $okVO = 0; $failVO = 0; $okBB = 0; $failBB = 0;
 $processedCount = 0;
 $skippedNonFbm = 0;
 
+logSection('SYNCHRONIZATION RUN');
 foreach ($rows as $r) {
   $csvSku = $r['sku'];
   $stock  = (int)$r['stock'];
@@ -1542,14 +1634,14 @@ $usedSummary = sprintf(
   $billbeeCategoryCounters['medium'] ?? 0,
   $billbeeCategoryCounters['slow'] ?? 0
 );
-logMsg($usedSummary);
-
 $sourceSummary = sprintf(
   '📊 Velocity sources → Billbee=%d, VentoryOne=%d, default=%d',
   $billbeeSourceCounters['billbee'] ?? 0,
   $billbeeSourceCounters['ventoryone'] ?? 0,
   $billbeeSourceCounters['default'] ?? 0
 );
+logSection('RUN SUMMARY');
+logMsg($usedSummary);
 logMsg($sourceSummary);
 
 logMsg("✅ Done. VO OK: $okVO/$processedCount | VO Fail: $failVO/$processedCount | Billbee OK: $okBB/$processedCount | Billbee Fail: $failBB/$processedCount");
