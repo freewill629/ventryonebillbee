@@ -86,6 +86,8 @@ define('RETRY_BASE_MS', 600);
 define('CONNECT_TIMEOUT', 15);
 define('REQUEST_TIMEOUT', 45);
 
+// Simple caches populated during runtime to avoid repeated VO lookups per SKU.
+$VO_STOCK_CACHE = [];
 
 /* ================ LOGGING ================= */
 function logMsg($msg) {
@@ -1478,7 +1480,7 @@ function updateBillbee($sku, $qty) {
 }
 
 /* ================= MAIN =================== */
-$heading = '========== INVENTORY SYNC (' . runModeLabel() . ') ==========';
+$heading = '========== INVENTORY SYNC (' . runModeLabel() . ') =========='; 
 logMsg($heading);
 if (isDryRun()) {
   logMsg('📋 Mode: DRY-RUN → external services will NOT be updated.');
