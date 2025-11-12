@@ -794,24 +794,6 @@ function voExtractMetricDetails(array $row) {
   return [$metric, $fieldUsed];
 }
 
-function voCacheStockRow($skuBase, array $row) {
-  global $VO_STOCK_CACHE;
-  $key = canonicalSku($skuBase);
-  if ($key === '') {
-    return;
-  }
-  $VO_STOCK_CACHE[$key] = $row;
-}
-
-function voGetCachedStockRow($skuBase) {
-  global $VO_STOCK_CACHE;
-  $key = canonicalSku($skuBase);
-  if ($key === '') {
-    return null;
-  }
-  return $VO_STOCK_CACHE[$key] ?? null;
-}
-
 function voFormatPath(array $path) {
   if (!$path) {
     return '';
@@ -1001,7 +983,6 @@ function voFetchStockEntry($skuBase, &$note = null) {
           continue;
         }
 
-        voCacheStockRow($skuBase, $row);
         return $row;
       }
 
