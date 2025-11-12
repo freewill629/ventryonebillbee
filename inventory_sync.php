@@ -1358,48 +1358,55 @@ function voVerifyLooseEquals($skuBase, $expect) {
 function updateVentoryTotal($csvSku, $total) {
   $skuBase = normalizeVoSku($csvSku);
 
-  $lookupNote = null;
-  $lookupRow = voFetchStockEntry($skuBase, $lookupNote);
-  $preferredSku = voResolveSkuForUpdate($lookupRow ?? null, $skuBase, $csvSku);
-  $ident = [
-    'sku' => $preferredSku,
-    'sku_id' => $lookupRow ? voExtractSkuId($lookupRow) : null,
-    'organization_id' => $lookupRow ? voExtractOrganizationId($lookupRow) : null,
-  ];
+  $maxAttempts = isDryRun() ? 1 : 3;
+  $lastVerifyNote = null;
 
-  if (!$lookupRow && $lookupNote) {
-    logMsg("ℹ️ VO lookup $skuBase before update: $lookupNote");
-  } elseif ($lookupRow && !array_key_exists('_metric_value', $lookupRow)) {
-    logMsg("ℹ️ VO lookup $skuBase before update: stock-metric-missing");
-  }
+  for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+    $lookupNote = null;
+    $lookupRow = voFetchStockEntry($skuBase, $lookupNote);
+    $preferredSku = voResolveSkuForUpdate($lookupRow ?? null, $skuBase, $csvSku);
+    $ident = [
+      'sku' => $preferredSku,
+      'sku_id' => $lookupRow ? voExtractSkuId($lookupRow) : null,
+      'organization_id' => $lookupRow ? voExtractOrganizationId($lookupRow) : null,
+    ];
 
-  [$okC, $cartonNote] = voSetCartonsZero($ident);
-  if (!$okC) {
-    logMsg("⚠️ VO carton reset $skuBase failed: $cartonNote");
-  }
+    if (!$lookupRow && $lookupNote) {
+      logMsg("ℹ️ VO lookup $skuBase before update: $lookupNote");
+    } elseif ($lookupRow && !array_key_exists('_metric_value', $lookupRow)) {
+      logMsg("ℹ️ VO lookup $skuBase before update: stock-metric-missing");
+    }
 
-  [$okL, $looseNote] = voSetLooseToTotal($ident, $total);
-  if (!$okL) {
-    logMsg("⚠️ VO loose set $skuBase failed: $looseNote");
-  }
+    [$okC, $cartonNote] = voSetCartonsZero($ident);
+    if (!$okC) {
+      logMsg("⚠️ VO carton reset $skuBase failed: $cartonNote");
+    }
 
-  if ($okC && $okL) {
+    [$okL, $looseNote] = voSetLooseToTotal($ident, $total, $lookupRow);
+    if (!$okL) {
+      logMsg("⚠️ VO loose set $skuBase failed: $looseNote");
+    }
+
+    if (!$okC || !$okL) {
+      logMsg("❌ VO FAIL $skuBase → total=$total (cartonsZero=" . ($okC ? 'OK' : 'FAIL') . ", looseSet=" . ($okL ? 'OK' : 'FAIL') . ")");
+      return false;
+    }
+
     if (isDryRun()) {
       logMsg("🧪 DRY-RUN: VentoryOne would set $skuBase → STK–Insgesamt=$total (cartons=0, loose=$total)");
       return true;
     }
 
-    // verify (after async processing it may take a moment; still try once)
     [$okV, $note] = voVerifyLooseEquals($skuBase, $total);
     if ($okV) {
       logMsg("✅ VO OK $skuBase → target=$total | $note");
     } else {
       logMsg("✅ VO submitted $skuBase total=$total (verify pending: $note)");
     }
-    return true;
   }
 
-  logMsg("❌ VO FAIL $skuBase → total=$total (cartonsZero=" . ($okC?'OK':'FAIL') . ", looseSet=" . ($okL?'OK':'FAIL') . ")");
+  $pendingNote = $lastVerifyNote !== null ? $lastVerifyNote : 'verification-missing';
+  logMsg("❌ VO FAIL $skuBase → total=$total after retries (last verify: $pendingNote)");
   return false;
 }
 
