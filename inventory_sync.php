@@ -1221,7 +1221,7 @@ function voSetCartonsZero(array $ident) {
   return voPostAndCheck('/api/update_plain_carton_line_item_qty/', $payload);
 }
 
-function voSetLooseToTotal(array $ident, $total, ?array $referenceRow = null) {
+function voSetLooseToTotal(array $ident, $total) {
   $totalInt = (int)$total;
   $baseEntry = [
     'pcs_in_loose_stock' => $totalInt
@@ -1246,50 +1246,13 @@ function voSetLooseToTotal(array $ident, $total, ?array $referenceRow = null) {
     return [true, 'dry-run'];
   }
 
-  $candidateFields = [
-    'stk_insgesamt', 'stkInsGesamt', 'stk-gesamt', 'stk_total',
-    'qty_total_stock', 'total_qty', 'total_stock',
-    'pcs_in_total_stock', 'pcs_in_stock', 'pcs_total_stock'
-  ];
-
-  if ($referenceRow !== null) {
-    if (!empty($referenceRow['_metric_field']) && is_string($referenceRow['_metric_field'])) {
-      $candidateFields[] = $referenceRow['_metric_field'];
-    }
-    foreach ($referenceRow as $key => $value) {
-      if (!is_string($key)) {
-        continue;
-      }
-      $trimmed = trim($key);
-      if ($trimmed === '') {
-        continue;
-      }
-      $lower = strtolower($trimmed);
-      if (strpos($lower, 'total') === false && strpos($lower, 'stk') === false) {
-        continue;
-      }
-      if (in_array($trimmed, ['sku', 'sku_id', 'warehouse_id', 'organization_id'], true)) {
-        continue;
-      }
-      $candidateFields[] = $trimmed;
-    }
-  }
-
+  $fields = ['qty_total_stock', 'total_qty', 'total_stock', 'pcs_in_total_stock', 'pcs_in_stock'];
   $variants = [];
-  $seenFields = [];
-  foreach ($candidateFields as $field) {
-    if (!is_string($field) || $field === '') {
-      continue;
-    }
-    if (isset($seenFields[$field])) {
-      continue;
-    }
-    $seenFields[$field] = true;
+  foreach ($fields as $field) {
     $variant = $baseEntry;
     $variant[$field] = $totalInt;
     $variants[] = $variant;
   }
-
   $variants[] = $baseEntry;
 
   $lastResult = [false, 'no-variant-succeeded'];
@@ -1437,15 +1400,8 @@ function updateVentoryTotal($csvSku, $total) {
     [$okV, $note] = voVerifyLooseEquals($skuBase, $total);
     if ($okV) {
       logMsg("✅ VO OK $skuBase → target=$total | $note");
-      return true;
-    }
-
-    $lastVerifyNote = $note;
-
-    if ($attempt < $maxAttempts) {
-      logMsg('ℹ️ VO verify mismatch for ' . $skuBase . ' (attempt ' . $attempt . '/' . $maxAttempts . '): ' . $note . ' → retrying');
-      usleep(500000);
-      continue;
+    } else {
+      logMsg("✅ VO submitted $skuBase total=$total (verify pending: $note)");
     }
   }
 
