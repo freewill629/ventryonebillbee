@@ -269,16 +269,50 @@ function billbeeApiRequest($path, array $query = []) {
     return [null, 'HTTP ' . $code . ($extra ? ' | ' . $extra : '')];
   }
 
-  if ($resp === null || $resp === '') {
-    return [[], null];
-  }
-
-  $json = json_decode($resp, true);
-  if (!is_array($json)) {
+  $decoded = billbeeDecodeJson($resp);
+  if ($decoded === null) {
     return [null, 'invalid-json'];
   }
 
-  return [$json, null];
+  return [$decoded, null];
+}
+
+function billbeeDecodeJson($payload) {
+  if ($payload === null || $payload === '') {
+    return [];
+  }
+
+  if (!is_string($payload)) {
+    return null;
+  }
+
+  $candidates = [];
+
+  $candidates[] = $payload;
+  $candidates[] = preg_replace('/^\xEF\xBB\xBF/', '', $payload);
+
+  $trimmed = trim($payload);
+  if ($trimmed !== $payload) {
+    $candidates[] = $trimmed;
+  }
+
+  $sanitized = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $payload);
+  if ($sanitized !== $payload) {
+    $candidates[] = $sanitized;
+    $candidates[] = trim($sanitized);
+  }
+
+  foreach ($candidates as $candidate) {
+    if (!is_string($candidate)) {
+      continue;
+    }
+    $json = json_decode($candidate, true);
+    if (json_last_error() === JSON_ERROR_NONE && is_array($json)) {
+      return $json;
+    }
+  }
+
+  return null;
 }
 
 function billbeeExtractOrderItems(array $order) {
@@ -1195,7 +1229,6 @@ function voSetCartonsZero(array $ident) {
   }
 
   if (isDryRun()) {
-    logMsg('🧪 DRY-RUN: skip VentoryOne carton reset for ' . voDescribeIdent($ident));
     return [true, 'dry-run'];
   }
 
@@ -1341,7 +1374,6 @@ function voVerifyLooseEquals($skuBase, $expect) {
 
   if ($totalInfo === null && $looseInfo === null && $metricValue === null) {
     $debugKeys = implode(',', array_keys($row));
-    logMsg("ℹ️ VO metric scan failed for $skuBase | keys=$debugKeys");
     return [false, 'stock-metric-missing'];
   }
 
@@ -1429,8 +1461,7 @@ function updateVentoryTotal($csvSku, $total) {
     }
 
     if (isDryRun()) {
-      logMsg("🧪 DRY-RUN: VentoryOne would set $skuBase → STK–Insgesamt=$total (cartons=0, loose=$total)");
-      return true;
+      return [true, 'dry-run'];
     }
 
     [$okV, $note] = voVerifyLooseEquals($skuBase, $total);
@@ -1464,19 +1495,21 @@ function updateBillbee($sku, $qty) {
   ];
 
   if (isDryRun()) {
-    logMsg('🧪 DRY-RUN: skip Billbee stock update for ' . $sku . ' → ' . (int)$qty);
-    return true;
+    return [true, 'dry-run'];
   }
 
-  [$code, $resp] = httpJsonWithRetry($url, 'POST', $headers, $payload);
+  [$code, $resp, $curlErr, $verbose] = httpJsonWithRetry($url, 'POST', $headers, $payload);
 
   if ($code >= 200 && $code < 300) {
-    logMsg("✅ Billbee OK $sku → $qty");
-    return true;
+    return [true, null];
   }
   $preview = $resp ? substr($resp, 0, 240) : 'no-body';
-  logMsg("❌ Billbee FAIL $sku HTTP $code | Resp: $preview");
-  return false;
+  $extra = $curlErr ?: trim($verbose);
+  $note = 'HTTP ' . $code . ' | Resp: ' . $preview;
+  if ($extra !== '') {
+    $note .= ' | ' . $extra;
+  }
+  return [false, $note];
 }
 
 /* ================= MAIN =================== */
@@ -1552,7 +1585,19 @@ foreach ($rows as $r) {
   $processedCount++;
 
   // --- VentoryOne: STK – Insgesamt = CSV total (cartons=0, loose=stock) ---
-  if (updateVentoryTotal($csvSku, $stock)) $okVO++; else $failVO++;
+  [$voOk, $voNote] = updateVentoryTotal($csvSku, $stock);
+  if ($voOk) {
+    $okVO++;
+    if ($voNote === 'dry-run') {
+      logMsg('🧪 DRY-RUN: VentoryOne would set ' . $csvSku . ' → ' . $stock . ' pcs');
+    } else {
+      logMsg('✅ VentoryOne ' . $csvSku . ' → ' . $stock . ' pcs');
+    }
+  } else {
+    $failVO++;
+    $detail = $voNote !== null && $voNote !== '' ? ' (' . $voNote . ')' : '';
+    logMsg('❌ VentoryOne ' . $csvSku . ' failed (target ' . $stock . ' pcs)' . $detail);
+  }
 
   // --- Billbee: safety stock logic ---
   $category = BILLBEE_DEFAULT_CATEGORY;
@@ -1611,15 +1656,28 @@ foreach ($rows as $r) {
   $billbeeSourceCounters[$source]++;
 
   $bbAllOk = true;
+  $bbErrors = [];
   foreach (billbeeSkuTargets($csvSku) as $bbSku) {
-    if (!updateBillbee($bbSku, $bbQty)) {
+    [$bbOk, $bbNote] = updateBillbee($bbSku, $bbQty);
+    if (!$bbOk) {
       $bbAllOk = false;
+      $bbErrors[] = $bbSku . ': ' . $bbNote;
     }
   }
   if ($bbAllOk) {
     $okBB++;
+    if (isDryRun()) {
+      logMsg('🧪 DRY-RUN: Billbee would set ' . $csvSku . ' → stock=' . $stock . ', keep=' . $keep . ', update=' . $bbQty);
+    } else {
+      $suffix = $source === 'billbee'
+        ? ' (Billbee velocity ' . ($velocityLogContext['daily'] ?? 'n/a') . '/day)'
+        : '';
+      logMsg('✅ Billbee ' . $csvSku . ' → stock=' . $stock . ', keep=' . $keep . ', update=' . $bbQty . $suffix);
+    }
   } else {
     $failBB++;
+    $detail = $bbErrors ? ' (' . implode('; ', $bbErrors) . ')' : '';
+    logMsg('❌ Billbee ' . $csvSku . ' failed → stock=' . $stock . ', keep=' . $keep . ', update=' . $bbQty . $detail);
   }
 }
 
