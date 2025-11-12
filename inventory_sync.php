@@ -86,6 +86,8 @@ define('RETRY_BASE_MS', 600);
 define('CONNECT_TIMEOUT', 15);
 define('REQUEST_TIMEOUT', 45);
 
+// Simple caches populated during runtime to avoid repeated VO lookups per SKU.
+$VO_STOCK_CACHE = [];
 
 /* ================ LOGGING ================= */
 function logMsg($msg) {
@@ -1259,6 +1261,7 @@ function voSetLooseToTotal(array $ident, $total, ?array $referenceRow = null) {
   }
 
   if (isDryRun()) {
+    logMsg('🧪 DRY-RUN: skip VentoryOne loose stock set to ' . $totalInt . ' for ' . voDescribeIdent($ident));
     return [true, 'dry-run'];
   }
 
@@ -1425,7 +1428,6 @@ function updateVentoryTotal($csvSku, $total) {
 
   $maxAttempts = isDryRun() ? 1 : 3;
   $lastVerifyNote = null;
-  $lookupWarnings = [];
 
   for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
     $lookupNote = null;
@@ -1438,27 +1440,24 @@ function updateVentoryTotal($csvSku, $total) {
     ];
 
     if (!$lookupRow && $lookupNote) {
-      $lookupWarnings[] = $lookupNote;
+      logMsg("ℹ️ VO lookup $skuBase before update: $lookupNote");
     } elseif ($lookupRow && !array_key_exists('_metric_value', $lookupRow)) {
-      $lookupWarnings[] = 'stock-metric-missing';
+      logMsg("ℹ️ VO lookup $skuBase before update: stock-metric-missing");
     }
 
     [$okC, $cartonNote] = voSetCartonsZero($ident);
     if (!$okC) {
-      $note = 'carton reset failed: ' . $cartonNote;
-      if ($lookupWarnings) {
-        $note .= ' | lookup: ' . implode('; ', array_unique($lookupWarnings));
-      }
-      return [false, $note];
+      logMsg("⚠️ VO carton reset $skuBase failed: $cartonNote");
     }
 
     [$okL, $looseNote] = voSetLooseToTotal($ident, $total, $lookupRow);
     if (!$okL) {
-      $note = 'loose update failed: ' . $looseNote;
-      if ($lookupWarnings) {
-        $note .= ' | lookup: ' . implode('; ', array_unique($lookupWarnings));
-      }
-      return [false, $note];
+      logMsg("⚠️ VO loose set $skuBase failed: $looseNote");
+    }
+
+    if (!$okC || !$okL) {
+      logMsg("❌ VO FAIL $skuBase → total=$total (cartonsZero=" . ($okC ? 'OK' : 'FAIL') . ", looseSet=" . ($okL ? 'OK' : 'FAIL') . ")");
+      return false;
     }
 
     if (isDryRun()) {
@@ -1467,22 +1466,22 @@ function updateVentoryTotal($csvSku, $total) {
 
     [$okV, $note] = voVerifyLooseEquals($skuBase, $total);
     if ($okV) {
-      return [true, $note];
+      logMsg("✅ VO OK $skuBase → target=$total | $note");
+      return true;
     }
 
     $lastVerifyNote = $note;
 
     if ($attempt < $maxAttempts) {
+      logMsg('ℹ️ VO verify mismatch for ' . $skuBase . ' (attempt ' . $attempt . '/' . $maxAttempts . '): ' . $note . ' → retrying');
       usleep(500000);
       continue;
     }
   }
 
   $pendingNote = $lastVerifyNote !== null ? $lastVerifyNote : 'verification-missing';
-  if ($lookupWarnings) {
-    $pendingNote .= ' | lookup: ' . implode('; ', array_unique($lookupWarnings));
-  }
-  return [false, $pendingNote];
+  logMsg("❌ VO FAIL $skuBase → total=$total after retries (last verify: $pendingNote)");
+  return false;
 }
 
 /* ============== Billbee ============== */
@@ -1514,7 +1513,7 @@ function updateBillbee($sku, $qty) {
 }
 
 /* ================= MAIN =================== */
-$heading = '========== INVENTORY SYNC (' . runModeLabel() . ') ==========';
+$heading = '========== INVENTORY SYNC (' . runModeLabel() . ') =========='; 
 logMsg($heading);
 if (isDryRun()) {
   logMsg('📋 Mode: DRY-RUN → external services will NOT be updated.');
@@ -1627,6 +1626,25 @@ foreach ($rows as $r) {
 
   $keep = billbeeBufferForCategory($category);
   $bbQty = adjustStockForBillbee($stock, $category);
+
+  switch ($velocityLogContext['type']) {
+    case 'billbee':
+      $total = $velocityLogContext['total'];
+      $window = (int)$velocityLogContext['window'];
+      if ($total !== null) {
+        $detail = 'sold=' . $total . ' over ' . $window . 'd';
+      } else {
+        $detail = 'window=' . $window . 'd';
+      }
+      logMsg("ℹ️ Billbee velocity $csvSku → $category (avg {$velocityLogContext['daily']}/day, $detail, keep $keep)");
+      break;
+    default:
+      $reason = $velocityLogContext['reason'] ?? 'no Billbee velocity data';
+      logMsg('ℹ️ Billbee velocity fallback for ' . $csvSku . ' → category=' . $category . ' (keep ' . $keep . ', ' . $reason . ')');
+      break;
+  }
+
+  logMsg("ℹ️ Billbee allocation $csvSku → stock=$stock, keep=$keep, update=$bbQty, source=$source");
 
   if (!isset($billbeeCategoryCounters[$category])) {
     $billbeeCategoryCounters[$category] = 0;
