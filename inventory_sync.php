@@ -12,7 +12,7 @@ date_default_timezone_set('Europe/Berlin');
 error_reporting(E_ALL);
 ini_set('display_errors', 0);
 
-// Toggle the default run behaviour here: set to 'dry' to simulate or 'live' to push updates.
+// Toggle default behaviour here: set to 'dry' to simulate or 'live' to push updates.
 define('DEFAULT_RUN_MODE', 'dry');
 
 // Determine whether log output should also be echoed to STDOUT.
@@ -33,24 +33,6 @@ foreach (array_slice($argv, 1) as $arg) {
   } elseif ($arg === '--live') {
     $forcedMode = 'live';
   }
-}
-
-$scriptName = basename(__FILE__);
-if ($showHelp) {
-  $usage = <<<TXT
-Inventory Sync usage:
-  php $scriptName [--dry-run|--dry|--live] [--verbose|-v] [--quiet|-q]
-
-Run modes:
-  - DEFAULT_RUN_MODE at the top of this file sets the default when no flag is given.
-  - Use --dry-run (or --dry) to simulate without updating VentoryOne or Billbee.
-  - Use --live to push changes to both systems.
-
-Logging:
-  - Output is written to the terminal (unless --quiet) and to a timestamped log file.
-TXT;
-  fwrite(STDOUT, $usage . PHP_EOL);
-  exit(0);
 }
 
 $runMode = $forcedMode ?? DEFAULT_RUN_MODE;
