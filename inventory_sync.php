@@ -68,6 +68,7 @@ define('CSV_SKU_COL', 'Variant SKU');
 define('CSV_QTY_COL', 'Inventory Available: Cafol DE');
 
 define('LOCAL_CSV_DIR', __DIR__ . '/csv_files');
+// Each execution records a timestamped log file alongside this script for later review.
 define('LOG_FILE', __DIR__ . '/sync_' . date('Ymd_His') . '.log');
 define('LOG_ECHO_ENABLED', $logEchoEnabled);
 
