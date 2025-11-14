@@ -1473,8 +1473,12 @@ function updateVentoryTotal($csvSku, $total) {
     }
 
     if (!$okC || !$okL) {
-      logMsg("❌ VO FAIL $skuBase → total=$total (cartonsZero=" . ($okC ? 'OK' : 'FAIL') . ", looseSet=" . ($okL ? 'OK' : 'FAIL') . ")");
-      return false;
+      $detailParts = [];
+      $detailParts[] = 'cartonsZero=' . ($okC ? 'OK' : 'FAIL' . ($cartonNote !== null && $cartonNote !== '' ? '[' . $cartonNote . ']' : ''));
+      $detailParts[] = 'looseSet=' . ($okL ? 'OK' : 'FAIL' . ($looseNote !== null && $looseNote !== '' ? '[' . $looseNote . ']' : ''));
+      $detail = implode('; ', $detailParts);
+      logMsg("❌ VO FAIL $skuBase → total=$total ($detail)");
+      return [false, $detail];
     }
 
     if (isDryRun()) {
@@ -1484,7 +1488,7 @@ function updateVentoryTotal($csvSku, $total) {
     [$okV, $note] = voVerifyLooseEquals($skuBase, $total);
     if ($okV) {
       logMsg("✅ VO OK $skuBase → target=$total | $note");
-      return true;
+      return [true, $note];
     }
 
     $lastVerifyNote = $note;
@@ -1498,7 +1502,7 @@ function updateVentoryTotal($csvSku, $total) {
 
   $pendingNote = $lastVerifyNote !== null ? $lastVerifyNote : 'verification-missing';
   logMsg("❌ VO FAIL $skuBase → total=$total after retries (last verify: $pendingNote)");
-  return false;
+  return [false, $pendingNote];
 }
 
 /* ============== Billbee ============== */
