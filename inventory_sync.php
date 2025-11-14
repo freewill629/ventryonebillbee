@@ -1115,37 +1115,59 @@ function voExtractOrganizationId(array $row) {
 }
 
 function voResolveSkuForUpdate(?array $row = null, $skuBase = '', $csvSku = '') {
-  $candidates = [];
+  $preferred = [];
+  $fallback  = [];
 
   if (is_array($row)) {
-    foreach ([
-      '_matched_candidate', 'sku', 'sku_code', 'skuCode', 'sku_name', 'skuName',
+    $primaryFields = [
+      'sku', 'sku_code', 'skuCode', 'sku_name', 'skuName',
       'sku_display_name', 'skuDisplayName', 'sku_full_name', 'skuFullName',
-      'sku_value', 'skuValue', 'variation_name', 'variationName', 'name'
-    ] as $field) {
+      'sku_value', 'skuValue'
+    ];
+    foreach ($primaryFields as $field) {
       if (!array_key_exists($field, $row)) continue;
       $value = $row[$field];
-      if (is_string($value)) {
-        $trimmed = trim($value);
-        if ($trimmed !== '') {
-          $candidates[] = $trimmed;
-        }
-      }
+      if (!is_string($value)) continue;
+      $trimmed = trim($value);
+      if ($trimmed === '') continue;
+      $preferred[] = $trimmed;
+    }
+
+    $fallbackFields = [
+      '_matched_candidate', 'variation_name', 'variationName', 'name'
+    ];
+    foreach ($fallbackFields as $field) {
+      if (!array_key_exists($field, $row)) continue;
+      $value = $row[$field];
+      if (!is_string($value)) continue;
+      $trimmed = trim($value);
+      if ($trimmed === '') continue;
+      $fallback[] = $trimmed;
     }
   }
 
   if (is_string($skuBase) && $skuBase !== '') {
-    $candidates[] = $skuBase;
+    array_unshift($preferred, $skuBase);
   }
 
-  if (is_string($csvSku) && $csvSku !== '' && $csvSku !== $skuBase) {
-    $candidates[] = $csvSku;
-  }
-
-  foreach ($candidates as $candidate) {
-    if ($candidate !== '') {
-      return $candidate;
+  if (is_string($csvSku) && $csvSku !== '') {
+    if ($csvSku !== $skuBase) {
+      $preferred[] = $csvSku;
     }
+  }
+
+  $seen = [];
+  $ordered = array_merge($preferred, $fallback);
+  foreach ($ordered as $candidate) {
+    if ($candidate === '') {
+      continue;
+    }
+    $canon = canonicalSku($candidate);
+    if ($canon === '' || isset($seen[$canon])) {
+      continue;
+    }
+    $seen[$canon] = true;
+    return $candidate;
   }
 
   return $skuBase ?: $csvSku;
@@ -1232,7 +1254,8 @@ function voSetCartonsZero(array $ident) {
 
   if (!empty($ident['sku_id'])) {
     $entry['sku_id'] = (int)$ident['sku_id'];
-  } else {
+  }
+  if (!empty($ident['sku'])) {
     $entry['sku'] = $ident['sku'];
   }
 
@@ -1265,7 +1288,8 @@ function voSetLooseToTotal(array $ident, $total, ?array $referenceRow = null) {
 
   if (!empty($ident['sku_id'])) {
     $baseEntry['sku_id'] = (int)$ident['sku_id'];
-  } else {
+  }
+  if (!empty($ident['sku'])) {
     $baseEntry['sku'] = $ident['sku'];
   }
 
