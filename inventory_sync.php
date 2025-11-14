@@ -1617,7 +1617,8 @@ $billbeeCategoryCounters = ['fast' => 0, 'medium' => 0, 'slow' => 0];
 $billbeeSourceCounters = ['billbee' => 0, 'default' => 0];
 
 $okVO = 0; $failVO = 0; $okBB = 0; $failBB = 0;
-$processedCount = 0;
+$voProcessedCount = 0;
+$billbeeProcessedCount = 0;
 $skippedNonFbm = 0;
 
 logSection('SYNCHRONIZATION RUN');
@@ -1625,13 +1626,7 @@ foreach ($rows as $r) {
   $csvSku = $r['sku'];
   $stock  = (int)$r['stock'];
 
-  if (!isFbmSku($csvSku)) {
-    $skippedNonFbm++;
-    logMsg('ℹ️ Skipping non-FBM SKU ' . $csvSku . ' (no stock update)');
-    continue;
-  }
-
-  $processedCount++;
+  $voProcessedCount++;
 
   // --- VentoryOne: STK – Insgesamt = CSV total (cartons=0, loose=stock) ---
   [$voOk, $voNote] = updateVentoryTotal($csvSku, $stock);
@@ -1647,6 +1642,14 @@ foreach ($rows as $r) {
     $detail = $voNote !== null && $voNote !== '' ? ' (' . $voNote . ')' : '';
     logMsg('❌ VentoryOne ' . $csvSku . ' failed (target ' . $stock . ' pcs)' . $detail);
   }
+
+  if (!isFbmSku($csvSku)) {
+    $skippedNonFbm++;
+    logMsg('ℹ️ Billbee skip non-FBM SKU ' . $csvSku . ' (VentoryOne updated only)');
+    continue;
+  }
+
+  $billbeeProcessedCount++;
 
   // --- Billbee: safety stock logic ---
   $category = BILLBEE_DEFAULT_CATEGORY;
@@ -1751,9 +1754,9 @@ logSection('RUN SUMMARY');
 logMsg($usedSummary);
 logMsg($sourceSummary);
 
-logMsg("✅ Done. VO OK: $okVO/$processedCount | VO Fail: $failVO/$processedCount | Billbee OK: $okBB/$processedCount | Billbee Fail: $failBB/$processedCount");
+logMsg("✅ Done. VO OK: $okVO/$voProcessedCount | VO Fail: $failVO/$voProcessedCount | Billbee OK: $okBB/$billbeeProcessedCount | Billbee Fail: $failBB/$billbeeProcessedCount");
 if ($skippedNonFbm > 0) {
-  logMsg('ℹ️ Skipped non-FBM SKUs: ' . $skippedNonFbm);
+  logMsg('ℹ️ Billbee skipped non-FBM SKUs: ' . $skippedNonFbm);
 }
 
 /* ================= NOTIFICATION (SMTP over STARTTLS, only on failures) =================== */
