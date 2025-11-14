@@ -16,10 +16,3 @@ to choose the mode:
 
 You can combine these with `--verbose` or `--quiet` to control terminal logging. Use
 `php inventory_sync.php --help` for a quick reminder of the available options.
-
-## Logs
-
-Every execution creates a timestamped log file named `sync_YYYYMMDD_HHMMSS.log` in the same
-directory as the script. These logs keep the full API responses and velocity diagnostics even
-when the terminal output is quieted, so you can share details with support without re-running
-the sync.
