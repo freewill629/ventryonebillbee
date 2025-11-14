@@ -12,6 +12,9 @@ date_default_timezone_set('Europe/Berlin');
 error_reporting(E_ALL);
 ini_set('display_errors', 0);
 
+// Toggle default behaviour here: set to 'dry' to simulate or 'live' to push updates.
+define('DEFAULT_RUN_MODE', 'dry');
+
 // Determine whether log output should also be echoed to STDOUT.
 $argv = $argv ?? [];
 $forceEcho  = false;
@@ -29,7 +32,12 @@ foreach (array_slice($argv, 1) as $arg) {
   }
 }
 
-$runMode = $forcedMode ?? 'live';
+$runMode = $forcedMode ?? DEFAULT_RUN_MODE;
+$runModeSource = $forcedMode !== null ? 'CLI override' : 'DEFAULT_RUN_MODE constant';
+if (!in_array($runMode, ['dry', 'live'], true)) {
+  fwrite(STDERR, "Invalid run mode: $runMode. Use 'dry' or 'live'." . PHP_EOL);
+  exit(1);
+}
 define('SYNC_DRY_RUN', $runMode !== 'live');
 
 $defaultEcho = true;
@@ -1513,8 +1521,9 @@ function updateBillbee($sku, $qty) {
 }
 
 /* ================= MAIN =================== */
-$heading = '========== INVENTORY SYNC (' . runModeLabel() . ') =========='; 
+$heading = '========== INVENTORY SYNC (' . runModeLabel() . ') ==========';
 logMsg($heading);
+logMsg('⚙️ Mode selection: ' . $runModeSource . ' (default toggle via DEFAULT_RUN_MODE)');
 if (isDryRun()) {
   logMsg('📋 Mode: DRY-RUN → external services will NOT be updated.');
 } else {
