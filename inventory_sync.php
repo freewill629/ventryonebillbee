@@ -12,16 +12,22 @@ date_default_timezone_set('Europe/Berlin');
 error_reporting(E_ALL);
 ini_set('display_errors', 0);
 
+// Toggle the default run behaviour here: set to 'dry' to simulate or 'live' to push updates.
+define('DEFAULT_RUN_MODE', 'dry');
+
 // Determine whether log output should also be echoed to STDOUT.
 $argv = $argv ?? [];
 $forceEcho  = false;
 $forceQuiet = false;
 $forcedMode = null;
+$showHelp  = false;
 foreach (array_slice($argv, 1) as $arg) {
   if ($arg === '--verbose' || $arg === '-v') {
     $forceEcho = true;
   } elseif ($arg === '--quiet' || $arg === '-q') {
     $forceQuiet = true;
+  } elseif ($arg === '--help' || $arg === '-h') {
+    $showHelp = true;
   } elseif ($arg === '--dry-run' || $arg === '--dry') {
     $forcedMode = 'dry';
   } elseif ($arg === '--live') {
@@ -29,7 +35,30 @@ foreach (array_slice($argv, 1) as $arg) {
   }
 }
 
-$runMode = $forcedMode ?? 'live';
+$scriptName = basename(__FILE__);
+if ($showHelp) {
+  $usage = <<<TXT
+Inventory Sync usage:
+  php $scriptName [--dry-run|--dry|--live] [--verbose|-v] [--quiet|-q]
+
+Run modes:
+  - DEFAULT_RUN_MODE at the top of this file sets the default when no flag is given.
+  - Use --dry-run (or --dry) to simulate without updating VentoryOne or Billbee.
+  - Use --live to push changes to both systems.
+
+Logging:
+  - Output is written to the terminal (unless --quiet) and to a timestamped log file.
+TXT;
+  fwrite(STDOUT, $usage . PHP_EOL);
+  exit(0);
+}
+
+$runMode = $forcedMode ?? DEFAULT_RUN_MODE;
+$runModeSource = $forcedMode !== null ? 'CLI override' : 'DEFAULT_RUN_MODE constant';
+if (!in_array($runMode, ['dry', 'live'], true)) {
+  fwrite(STDERR, "Invalid run mode: $runMode. Use 'dry' or 'live'." . PHP_EOL);
+  exit(1);
+}
 define('SYNC_DRY_RUN', $runMode !== 'live');
 
 $defaultEcho = true;
@@ -57,6 +86,7 @@ define('CSV_SKU_COL', 'Variant SKU');
 define('CSV_QTY_COL', 'Inventory Available: Cafol DE');
 
 define('LOCAL_CSV_DIR', __DIR__ . '/csv_files');
+// Each execution records a timestamped log file alongside this script for later review.
 define('LOG_FILE', __DIR__ . '/sync_' . date('Ymd_His') . '.log');
 define('LOG_ECHO_ENABLED', $logEchoEnabled);
 
@@ -98,6 +128,11 @@ function logMsg($msg) {
   file_put_contents(LOG_FILE, $line, FILE_APPEND);
 }
 
+function logMsgFileOnly($msg) {
+  $line = '[' . date('Y-m-d H:i:s') . '] ' . $msg . PHP_EOL;
+  file_put_contents(LOG_FILE, $line, FILE_APPEND);
+}
+
 function runModeLabel() {
   return SYNC_DRY_RUN ? 'DRY-RUN' : 'LIVE';
 }
@@ -129,6 +164,7 @@ function httpJsonWithRetry($url, $method, $headers, $jsonBody) {
       CURLOPT_POSTFIELDS     => $body,
       CURLOPT_SSL_VERIFYPEER => true,
       CURLOPT_SSL_VERIFYHOST => 2,
+      CURLOPT_ENCODING       => '',
       CURLOPT_VERBOSE        => true,
       CURLOPT_STDERR         => $verbose,
     ]);
@@ -1098,37 +1134,61 @@ function voExtractOrganizationId(array $row) {
 }
 
 function voResolveSkuForUpdate(?array $row = null, $skuBase = '', $csvSku = '') {
-  $candidates = [];
+  $preferred = [];
+  $fallback  = [];
 
   if (is_array($row)) {
-    foreach ([
-      '_matched_candidate', 'sku', 'sku_code', 'skuCode', 'sku_name', 'skuName',
+    $primaryFields = [
+      'sku', 'sku_code', 'skuCode', 'sku_name', 'skuName',
       'sku_display_name', 'skuDisplayName', 'sku_full_name', 'skuFullName',
-      'sku_value', 'skuValue', 'variation_name', 'variationName', 'name'
-    ] as $field) {
+      'sku_value', 'skuValue'
+    ];
+    foreach ($primaryFields as $field) {
       if (!array_key_exists($field, $row)) continue;
       $value = $row[$field];
-      if (is_string($value)) {
-        $trimmed = trim($value);
-        if ($trimmed !== '') {
-          $candidates[] = $trimmed;
-        }
-      }
+      if (!is_string($value)) continue;
+      $trimmed = trim($value);
+      if ($trimmed === '') continue;
+      $preferred[] = $trimmed;
     }
+
+    $fallbackFields = [
+      '_matched_candidate', 'variation_name', 'variationName', 'name'
+    ];
+    foreach ($fallbackFields as $field) {
+      if (!array_key_exists($field, $row)) continue;
+      $value = $row[$field];
+      if (!is_string($value)) continue;
+      $trimmed = trim($value);
+      if ($trimmed === '') continue;
+      $fallback[] = $trimmed;
+    }
+  }
+
+  if (is_string($csvSku) && $csvSku !== '') {
+    $preferred[] = $csvSku;
   }
 
   if (is_string($skuBase) && $skuBase !== '') {
-    $candidates[] = $skuBase;
-  }
-
-  if (is_string($csvSku) && $csvSku !== '' && $csvSku !== $skuBase) {
-    $candidates[] = $csvSku;
-  }
-
-  foreach ($candidates as $candidate) {
-    if ($candidate !== '') {
-      return $candidate;
+    if ($skuBase !== $csvSku) {
+      $fallback[] = $skuBase;
+    } else {
+      $preferred[] = $skuBase;
     }
+  }
+
+  $seen = [];
+  $ordered = array_merge($preferred, $fallback);
+  foreach ($ordered as $candidate) {
+    if ($candidate === '') {
+      continue;
+    }
+    $canon = canonicalSku($candidate);
+    if ($canon === '' || isset($seen[$canon])) {
+      continue;
+    }
+    $seen[$canon] = true;
+    return $candidate;
   }
 
   return $skuBase ?: $csvSku;
@@ -1215,7 +1275,8 @@ function voSetCartonsZero(array $ident) {
 
   if (!empty($ident['sku_id'])) {
     $entry['sku_id'] = (int)$ident['sku_id'];
-  } else {
+  }
+  if (!empty($ident['sku'])) {
     $entry['sku'] = $ident['sku'];
   }
 
@@ -1248,7 +1309,8 @@ function voSetLooseToTotal(array $ident, $total, ?array $referenceRow = null) {
 
   if (!empty($ident['sku_id'])) {
     $baseEntry['sku_id'] = (int)$ident['sku_id'];
-  } else {
+  }
+  if (!empty($ident['sku'])) {
     $baseEntry['sku'] = $ident['sku'];
   }
 
@@ -1456,8 +1518,12 @@ function updateVentoryTotal($csvSku, $total) {
     }
 
     if (!$okC || !$okL) {
-      logMsg("❌ VO FAIL $skuBase → total=$total (cartonsZero=" . ($okC ? 'OK' : 'FAIL') . ", looseSet=" . ($okL ? 'OK' : 'FAIL') . ")");
-      return false;
+      $detailParts = [];
+      $detailParts[] = 'cartonsZero=' . ($okC ? 'OK' : 'FAIL' . ($cartonNote !== null && $cartonNote !== '' ? '[' . $cartonNote . ']' : ''));
+      $detailParts[] = 'looseSet=' . ($okL ? 'OK' : 'FAIL' . ($looseNote !== null && $looseNote !== '' ? '[' . $looseNote . ']' : ''));
+      $detail = implode('; ', $detailParts);
+      logMsg("❌ VO FAIL $skuBase → total=$total ($detail)");
+      return [false, $detail];
     }
 
     if (isDryRun()) {
@@ -1467,7 +1533,7 @@ function updateVentoryTotal($csvSku, $total) {
     [$okV, $note] = voVerifyLooseEquals($skuBase, $total);
     if ($okV) {
       logMsg("✅ VO OK $skuBase → target=$total | $note");
-      return true;
+      return [true, $note];
     }
 
     $lastVerifyNote = $note;
@@ -1481,7 +1547,7 @@ function updateVentoryTotal($csvSku, $total) {
 
   $pendingNote = $lastVerifyNote !== null ? $lastVerifyNote : 'verification-missing';
   logMsg("❌ VO FAIL $skuBase → total=$total after retries (last verify: $pendingNote)");
-  return false;
+  return [false, $pendingNote];
 }
 
 /* ============== Billbee ============== */
@@ -1513,13 +1579,15 @@ function updateBillbee($sku, $qty) {
 }
 
 /* ================= MAIN =================== */
-$heading = '========== INVENTORY SYNC (' . runModeLabel() . ') =========='; 
+$heading = '========== INVENTORY SYNC (' . runModeLabel() . ') ==========';
 logMsg($heading);
+logMsg('⚙️ Mode selection: ' . $runModeSource . ' (default toggle via DEFAULT_RUN_MODE)');
 if (isDryRun()) {
   logMsg('📋 Mode: DRY-RUN → external services will NOT be updated.');
 } else {
   logMsg('📋 Mode: LIVE → external services WILL be updated.');
 }
+logMsg('ℹ️ Switch modes by editing DEFAULT_RUN_MODE or using --dry-run / --live when running php ' . $scriptName);
 logMsg('🏬 VentoryOne warehouse target: ' . VO_WAREHOUSE_ID . ' (CAFOL)');
 logMsg('🎯 SKU filter: only items ending with -FBM are processed');
 logMsg('⏱️ Billbee velocity lookback: ' . BILLBEE_VELOCITY_LOOKBACK_DAYS . ' days');
@@ -1560,7 +1628,7 @@ if ($billbeeVelocityOk) {
   }
 } else {
   $billbeeVelocityError = $billbeeVelocityData['error'] ?? 'unknown error';
-  logMsg('⚠️ Billbee velocity data unavailable: ' . $billbeeVelocityError);
+  logMsgFileOnly('⚠️ Billbee velocity data unavailable: ' . $billbeeVelocityError);
   $billbeeVelocityInfo = [];
 }
 
@@ -1617,11 +1685,14 @@ foreach ($rows as $r) {
   } else {
     $reason = $billbeeVelocityOk
       ? 'no Billbee velocity match in last ' . $billbeeVelocityWindow . 'd'
-      : 'Billbee velocity unavailable (' . $billbeeVelocityError . ')';
+      : 'Billbee velocity data unavailable (default buffers applied)';
     $velocityLogContext = [
       'type'   => 'default',
       'reason' => $reason,
     ];
+    if (!$billbeeVelocityOk && $billbeeVelocityError !== null) {
+      $velocityLogContext['detail'] = $billbeeVelocityError;
+    }
   }
 
   $keep = billbeeBufferForCategory($category);
@@ -1639,8 +1710,14 @@ foreach ($rows as $r) {
       logMsg("ℹ️ Billbee velocity $csvSku → $category (avg {$velocityLogContext['daily']}/day, $detail, keep $keep)");
       break;
     default:
-      $reason = $velocityLogContext['reason'] ?? 'no Billbee velocity data';
-      logMsg('ℹ️ Billbee velocity fallback for ' . $csvSku . ' → category=' . $category . ' (keep ' . $keep . ', ' . $reason . ')');
+      $reason = $velocityLogContext['reason'] ?? null;
+      logMsg('ℹ️ Billbee velocity fallback for ' . $csvSku . ' → category=' . $category . ' (keep ' . $keep . ')');
+      if ($reason !== null) {
+        logMsgFileOnly('ℹ️ Billbee velocity fallback reason for ' . $csvSku . ': ' . $reason);
+      }
+      if (isset($velocityLogContext['detail'])) {
+        logMsgFileOnly('ℹ️ Billbee velocity fallback detail for ' . $csvSku . ': ' . $velocityLogContext['detail']);
+      }
       break;
   }
 
