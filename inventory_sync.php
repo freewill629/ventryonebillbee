@@ -1250,6 +1250,16 @@ function voDescribeIdent(array $ident) {
   return implode(', ', $parts);
 }
 
+function voSummarizeObserved(array $observed) {
+  $parts = [];
+  foreach (['metric', 'total', 'loose'] as $key) {
+    if (array_key_exists($key, $observed) && $observed[$key] !== null) {
+      $parts[] = $key . '=' . $observed[$key];
+    }
+  }
+  return implode(', ', $parts);
+}
+
 function voSetCartonsZero(array $ident) {
   $entry = ['carton_qty' => 0];
 
@@ -1278,13 +1288,9 @@ function voSetCartonsZero(array $ident) {
 
 function voSetLooseToTotal(array $ident, $total, ?array $referenceRow = null) {
   $totalInt = (int)$total;
+
   $baseEntry = [
-    'pcs_in_loose_stock'  => $totalInt,
-    'qty_loose_stock'     => $totalInt,
-    'pcs_in_total_stock'  => $totalInt,
-    'qty_total_stock'     => $totalInt,
-    'total_qty'           => $totalInt,
-    'total_stock'         => $totalInt,
+    'pcs_in_loose_stock' => $totalInt,
   ];
 
   if (!empty($ident['sku_id'])) {
@@ -1308,9 +1314,10 @@ function voSetLooseToTotal(array $ident, $total, ?array $referenceRow = null) {
   }
 
   $candidateFields = [
-    'stk_insgesamt', 'stkInsGesamt', 'stk-gesamt', 'stk_total',
+    'qty_loose_stock',
+    'pcs_in_total_stock', 'pcs_total_stock', 'pcs_in_stock',
     'qty_total_stock', 'total_qty', 'total_stock',
-    'pcs_in_total_stock', 'pcs_in_stock', 'pcs_total_stock',
+    'stk_insgesamt', 'stkInsGesamt', 'stk-gesamt', 'stk_total',
     'qty_available_stock', 'available_qty', 'available_stock',
     'qty_available', 'stock_available', 'qty_in_stock',
     'in_stock_qty', 'stock_qty', 'stock_quantity',
@@ -1330,7 +1337,7 @@ function voSetLooseToTotal(array $ident, $total, ?array $referenceRow = null) {
         continue;
       }
       $lower = strtolower($trimmed);
-      if (strpos($lower, 'total') === false && strpos($lower, 'stk') === false) {
+      if (strpos($lower, 'total') === false && strpos($lower, 'stk') === false && strpos($lower, 'loose') === false) {
         continue;
       }
       if (in_array($trimmed, ['sku', 'sku_id', 'warehouse_id', 'organization_id'], true)) {
@@ -1341,6 +1348,8 @@ function voSetLooseToTotal(array $ident, $total, ?array $referenceRow = null) {
   }
 
   $variants = [];
+  $variants[] = $baseEntry; // minimal payload first
+
   $seenFields = [];
   foreach ($candidateFields as $field) {
     if (!is_string($field) || $field === '') {
@@ -1354,8 +1363,6 @@ function voSetLooseToTotal(array $ident, $total, ?array $referenceRow = null) {
     $variant[$field] = $totalInt;
     $variants[] = $variant;
   }
-
-  $variants[] = $baseEntry;
 
   $lastResult = [false, 'no-variant-succeeded'];
   foreach ($variants as $entry) {
@@ -1373,13 +1380,13 @@ function voSetLooseToTotal(array $ident, $total, ?array $referenceRow = null) {
 
 function voVerifyLooseEquals($skuBase, $expect) {
   if (isDryRun()) {
-    return [true, 'dry-run'];
+    return [true, 'dry-run', ['metric' => null, 'total' => null, 'loose' => null]];
   }
 
   $note = null;
   $row = voFetchStockEntry($skuBase, $note);
   if (!$row) {
-    return [false, $note];
+    return [false, $note, ['metric' => null, 'total' => null, 'loose' => null]];
   }
 
   $expected = (int)$expect;
@@ -1416,7 +1423,7 @@ function voVerifyLooseEquals($skuBase, $expect) {
 
   if ($totalInfo === null && $looseInfo === null && $metricValue === null) {
     $debugKeys = implode(',', array_keys($row));
-    return [false, 'stock-metric-missing'];
+    return [false, 'stock-metric-missing', ['metric' => null, 'total' => null, 'loose' => null]];
   }
 
   $parts = [];
@@ -1459,17 +1466,25 @@ function voVerifyLooseEquals($skuBase, $expect) {
   }
 
   if (!$parts) {
-    return [false, 'verification-missing'];
+    return [false, 'verification-missing', ['metric' => null, 'total' => null, 'loose' => null]];
   }
 
-  return [$ok, implode(' | ', $parts)];
+  $observed = [
+    'metric' => $metricValue,
+    'total'  => $totalInfo[0] ?? null,
+    'loose'  => $looseInfo[0] ?? null,
+  ];
+
+  return [$ok, implode(' | ', $parts), $observed];
 }
 
 function updateVentoryTotal($csvSku, $total) {
   $skuBase = normalizeVoSku($csvSku);
 
-  $maxAttempts = isDryRun() ? 1 : 3;
+  $maxAttempts = isDryRun() ? 1 : 5;
+  $retryDelays = isDryRun() ? [] : [0.75, 1.5, 3.0, 4.5];
   $lastVerifyNote = null;
+  $lastVerifyObserved = ['metric' => null, 'total' => null, 'loose' => null];
 
   for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
     $lookupNote = null;
@@ -1510,22 +1525,30 @@ function updateVentoryTotal($csvSku, $total) {
       return [true, 'dry-run'];
     }
 
-    [$okV, $note] = voVerifyLooseEquals($skuBase, $total);
+    [$okV, $note, $observed] = voVerifyLooseEquals($skuBase, $total);
     if ($okV) {
       logMsg("✅ VO OK $skuBase → target=$total | $note");
       return [true, $note];
     }
 
     $lastVerifyNote = $note;
+    $lastVerifyObserved = $observed;
 
     if ($attempt < $maxAttempts) {
-      logMsg('ℹ️ VO verify mismatch for ' . $skuBase . ' (attempt ' . $attempt . '/' . $maxAttempts . '): ' . $note . ' → retrying');
-      usleep(500000);
+      $observedSummary = voSummarizeObserved($observed);
+      $retrySuffix = $observedSummary !== '' ? ' | observed ' . $observedSummary : '';
+      logMsg('ℹ️ VO verify mismatch for ' . $skuBase . ' (attempt ' . $attempt . '/' . $maxAttempts . '): ' . $note . $retrySuffix . ' → retrying');
+      $delay = $retryDelays[min($attempt - 1, count($retryDelays) - 1)] ?? 0.75;
+      usleep((int)($delay * 1000000));
       continue;
     }
   }
 
   $pendingNote = $lastVerifyNote !== null ? $lastVerifyNote : 'verification-missing';
+  $observedSummary = voSummarizeObserved($lastVerifyObserved);
+  if ($observedSummary !== '') {
+    $pendingNote .= ' | observed ' . $observedSummary;
+  }
   logMsg("❌ VO FAIL $skuBase → total=$total after retries (last verify: $pendingNote)");
   return [false, $pendingNote];
 }
