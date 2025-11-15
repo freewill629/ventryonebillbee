@@ -1632,7 +1632,7 @@ if ($billbeeVelocityOk) {
   }
 } else {
   $billbeeVelocityError = $billbeeVelocityData['error'] ?? 'unknown error';
-  logMsg('ℹ️ Billbee velocity metrics unavailable; default safety buffers will be used.');
+  logMsgFileOnly('ℹ️ Billbee velocity metrics unavailable; default safety buffers will be used.');
   logMsgFileOnly('⚠️ Billbee velocity data unavailable: ' . $billbeeVelocityError);
   $billbeeVelocityInfo = [];
 }
