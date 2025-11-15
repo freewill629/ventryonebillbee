@@ -116,6 +116,14 @@ function logMsgFileOnly($msg) {
   file_put_contents(LOG_FILE, $line, FILE_APPEND);
 }
 
+function logMsgSplit($consoleMsg, $fileMsg) {
+  $timestamp = '[' . date('Y-m-d H:i:s') . '] ';
+  if (LOG_ECHO_ENABLED) {
+    echo $timestamp . $consoleMsg . PHP_EOL;
+  }
+  file_put_contents(LOG_FILE, $timestamp . $fileMsg . PHP_EOL, FILE_APPEND);
+}
+
 function runModeLabel() {
   return SYNC_DRY_RUN ? 'DRY-RUN' : 'LIVE';
 }
@@ -521,6 +529,18 @@ function isFbmSku($sku) {
   }
 
   return preg_match('/-FBM$/i', trim($sku)) === 1;
+}
+
+function skuFulfillmentSuffix($sku) {
+  if (!is_string($sku)) {
+    return '';
+  }
+
+  if (preg_match('/-(FB[A-Z0-9]*)$/i', trim($sku), $m)) {
+    return strtoupper($m[1]);
+  }
+
+  return '';
 }
 
 function normalizeVoSku($sku) {
@@ -933,7 +953,7 @@ function voFindField($data, $targetKey) {
   return null;
 }
 
-function voFetchStockEntry($skuBase, &$note = null) {
+function voFetchStockEntry($skuBase, &$note = null, $originalSku = null) {
   $headers = [
     'Authorization: Bearer ' . VO_TOKEN,
     'Accept: application/json'
@@ -946,6 +966,8 @@ function voFetchStockEntry($skuBase, &$note = null) {
 
   $note = 'SKU not found in current_stock';
   $fallbackNote = null;
+  $targetSku = is_string($originalSku) && $originalSku !== '' ? $originalSku : $skuBase;
+  $targetSuffix = skuFulfillmentSuffix($targetSku);
 
   foreach ($attempts as $baseUrl) {
     if (!$baseUrl) continue;
@@ -981,7 +1003,16 @@ function voFetchStockEntry($skuBase, &$note = null) {
         $skuDisplay = null;
         $skuMatches = false;
         foreach (extractSkuCandidates($row) as $candidate) {
-          if (strcasecmp($candidate, $skuBase) === 0 || strcasecmp(normalizeVoSku($candidate), $skuBase) === 0) {
+          $candidateSuffix = skuFulfillmentSuffix($candidate);
+          if (strcasecmp($targetSuffix, $candidateSuffix) !== 0) {
+            continue;
+          }
+
+          if (
+            strcasecmp($candidate, $skuBase) === 0 ||
+            ($targetSku !== $skuBase && strcasecmp($candidate, $targetSku) === 0) ||
+            strcasecmp(normalizeVoSku($candidate), $skuBase) === 0
+          ) {
             $skuDisplay = $candidate;
             $skuMatches = true;
             break;
@@ -1261,6 +1292,26 @@ function voSummarizeObserved(array $observed) {
   return implode(', ', $parts);
 }
 
+function sanitizeVoNoteForConsole($note) {
+  if (!is_string($note) || $note === '') {
+    return $note;
+  }
+
+  $parts = array_map('trim', explode('|', $note));
+  $filtered = [];
+  foreach ($parts as $part) {
+    if ($part === '') {
+      continue;
+    }
+    if (stripos($part, 'matched ') === 0) {
+      continue;
+    }
+    $filtered[] = $part;
+  }
+
+  return implode(' | ', $filtered);
+}
+
 function voSetCartonsZero(array $ident) {
   $entry = ['carton_qty' => 0];
 
@@ -1379,13 +1430,13 @@ function voSetLooseToTotal(array $ident, $total, ?array $referenceRow = null) {
   return $lastResult;
 }
 
-function voVerifyLooseEquals($skuBase, $expect) {
+function voVerifyLooseEquals($skuBase, $expect, $originalSku = null) {
   if (isDryRun()) {
     return [true, 'dry-run', ['metric' => null, 'total' => null, 'loose' => null]];
   }
 
   $note = null;
-  $row = voFetchStockEntry($skuBase, $note);
+  $row = voFetchStockEntry($skuBase, $note, $originalSku);
   if (!$row) {
     return [false, $note, ['metric' => null, 'total' => null, 'loose' => null]];
   }
@@ -1489,7 +1540,7 @@ function updateVentoryTotal($csvSku, $total) {
 
   for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
     $lookupNote = null;
-    $lookupRow = voFetchStockEntry($skuBase, $lookupNote);
+    $lookupRow = voFetchStockEntry($skuBase, $lookupNote, $csvSku);
     $preferredSku = voResolveSkuForUpdate($lookupRow ?? null, $skuBase, $csvSku);
     $ident = [
       'sku' => $preferredSku,
@@ -1526,9 +1577,18 @@ function updateVentoryTotal($csvSku, $total) {
       return [true, 'dry-run'];
     }
 
-    [$okV, $note, $observed] = voVerifyLooseEquals($skuBase, $total);
+    [$okV, $note, $observed] = voVerifyLooseEquals($skuBase, $total, $csvSku);
     if ($okV) {
-      logMsg("✅ VO OK $skuBase → target=$total | $note");
+      $cleanNote = sanitizeVoNoteForConsole($note);
+      $consoleMsg = '✅ VO OK ' . $skuBase . ' → target=' . $total;
+      $fileMsg = $consoleMsg;
+      if (is_string($cleanNote) && $cleanNote !== '') {
+        $consoleMsg .= ' | ' . $cleanNote;
+      }
+      if (is_string($note) && $note !== '') {
+        $fileMsg .= ' | ' . $note;
+      }
+      logMsgSplit($consoleMsg, $fileMsg);
       return [true, $note];
     }
 
@@ -1538,7 +1598,12 @@ function updateVentoryTotal($csvSku, $total) {
     if ($attempt < $maxAttempts) {
       $observedSummary = voSummarizeObserved($observed);
       $retrySuffix = $observedSummary !== '' ? ' | observed ' . $observedSummary : '';
-      logMsg('ℹ️ VO verify mismatch for ' . $skuBase . ' (attempt ' . $attempt . '/' . $maxAttempts . '): ' . $note . $retrySuffix . ' → retrying');
+      $cleanNote = sanitizeVoNoteForConsole($note);
+      $fallbackDetail = (is_string($note) && $note !== '') ? $note : 'n/a';
+      $consoleDetail = ($cleanNote !== null && $cleanNote !== '') ? $cleanNote : $fallbackDetail;
+      $consoleMsg = 'ℹ️ VO verify mismatch for ' . $skuBase . ' (attempt ' . $attempt . '/' . $maxAttempts . '): ' . $consoleDetail . $retrySuffix . ' → retrying';
+      $fileMsg = 'ℹ️ VO verify mismatch for ' . $skuBase . ' (attempt ' . $attempt . '/' . $maxAttempts . '): ' . $note . $retrySuffix . ' → retrying';
+      logMsgSplit($consoleMsg, $fileMsg);
       $delay = $retryDelays[min($attempt - 1, count($retryDelays) - 1)] ?? 0.75;
       usleep((int)($delay * 1000000));
       continue;
@@ -1550,7 +1615,13 @@ function updateVentoryTotal($csvSku, $total) {
   if ($observedSummary !== '') {
     $pendingNote .= ' | observed ' . $observedSummary;
   }
-  logMsg("❌ VO FAIL $skuBase → total=$total after retries (last verify: $pendingNote)");
+  $cleanPending = sanitizeVoNoteForConsole($pendingNote);
+  $fallbackPending = (is_string($pendingNote) && $pendingNote !== '') ? $pendingNote : 'n/a';
+  $consolePending = ($cleanPending !== null && $cleanPending !== '') ? $cleanPending : $fallbackPending;
+  logMsgSplit(
+    '❌ VO FAIL ' . $skuBase . ' → total=' . $total . ' after retries (last verify: ' . $consolePending . ')',
+    '❌ VO FAIL ' . $skuBase . ' → total=' . $total . ' after retries (last verify: ' . $pendingNote . ')'
+  );
   return [false, $pendingNote];
 }
 
