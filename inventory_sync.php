@@ -68,11 +68,6 @@ define('FTP_DIR',  'bestand'); // CSV directory on FTP
 define('CSV_SKU_COL', 'Variant SKU');
 define('CSV_QTY_COL', 'Inventory Available: Cafol DE');
 
-// SKUs that should be ignored entirely during the sync run.
-define('SKIP_SKUS', [
-  'MW-OSC1-SIGR3-VISCO-MED',
-]);
-
 define('LOCAL_CSV_DIR', __DIR__ . '/csv_files');
 // Each execution records a timestamped log file alongside this script for later review.
 define('LOG_FILE', __DIR__ . '/sync_' . date('Ymd_His') . '.log');
@@ -1725,11 +1720,6 @@ logSection('SYNCHRONIZATION RUN');
 foreach ($rows as $r) {
   $csvSku = $r['sku'];
   $stock  = (int)$r['stock'];
-
-  if (in_array(canonicalSku($csvSku), array_map('canonicalSku', SKIP_SKUS), true)) {
-    logMsg('ℹ️ Skipping excluded SKU ' . $csvSku . ' (no VentoryOne/Billbee updates)');
-    continue;
-  }
 
   $voProcessedCount++;
 
