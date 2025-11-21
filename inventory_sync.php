@@ -1663,7 +1663,7 @@ if (isDryRun()) {
   logMsg('📋 Mode: LIVE → external services WILL be updated.');
 }
 logMsg('ℹ️ Switch modes by editing DEFAULT_RUN_MODE or using --dry-run / --live when running php ' . $scriptName);
-logMsg('🏬 VentoryOne warehouse target: ' . VO_WAREHOUSE_ID . ' (CAFOL)');
+logMsg('🏬 VentoryOne integration is currently disabled; no VentoryOne updates will be sent.');
 logMsg('🎯 SKU filter: only items ending with -FBM are processed');
 logMsg('⏱️ Billbee velocity lookback: ' . BILLBEE_VELOCITY_LOOKBACK_DAYS . ' days');
 
@@ -1713,6 +1713,7 @@ $billbeeSourceCounters = ['billbee' => 0, 'default' => 0];
 
 $okVO = 0; $failVO = 0; $okBB = 0; $failBB = 0;
 $voProcessedCount = 0;
+$voSkippedCount = 0;
 $billbeeProcessedCount = 0;
 $skippedNonFbm = 0;
 
@@ -1721,26 +1722,12 @@ foreach ($rows as $r) {
   $csvSku = $r['sku'];
   $stock  = (int)$r['stock'];
 
-  $voProcessedCount++;
-
-  // --- VentoryOne: STK – Insgesamt = CSV total (cartons=0, loose=stock) ---
-  [$voOk, $voNote] = updateVentoryTotal($csvSku, $stock);
-  if ($voOk) {
-    $okVO++;
-    if ($voNote === 'dry-run') {
-      logMsg('🧪 DRY-RUN: VentoryOne would set ' . $csvSku . ' → ' . $stock . ' pcs');
-    } else {
-      logMsg('✅ VentoryOne ' . $csvSku . ' → ' . $stock . ' pcs');
-    }
-  } else {
-    $failVO++;
-    $detail = $voNote !== null && $voNote !== '' ? ' (' . $voNote . ')' : '';
-    logMsg('❌ VentoryOne ' . $csvSku . ' failed (target ' . $stock . ' pcs)' . $detail);
-  }
+  $voSkippedCount++;
+  logMsg('ℹ️ VentoryOne update skipped for ' . $csvSku . ' (integration disabled)');
 
   if (!isFbmSku($csvSku)) {
     $skippedNonFbm++;
-    logMsg('ℹ️ Billbee skip non-FBM SKU ' . $csvSku . ' (VentoryOne updated only)');
+    logMsg('ℹ️ Billbee skip non-FBM SKU ' . $csvSku . ' (VentoryOne update skipped)');
     continue;
   }
 
@@ -1845,11 +1832,13 @@ $sourceSummary = sprintf(
   $billbeeSourceCounters['billbee'] ?? 0,
   $billbeeSourceCounters['default'] ?? 0
 );
+$ventorySummary = 'ℹ️ VentoryOne integration disabled; skipped ' . $voSkippedCount . ' SKUs.';
 logSection('RUN SUMMARY');
+logMsg($ventorySummary);
 logMsg($usedSummary);
 logMsg($sourceSummary);
 
-logMsg("✅ Done. VO OK: $okVO/$voProcessedCount | VO Fail: $failVO/$voProcessedCount | Billbee OK: $okBB/$billbeeProcessedCount | Billbee Fail: $failBB/$billbeeProcessedCount");
+logMsg("✅ Done. VentoryOne skipped: $voSkippedCount | Billbee OK: $okBB/$billbeeProcessedCount | Billbee Fail: $failBB/$billbeeProcessedCount");
 if ($skippedNonFbm > 0) {
   logMsg('ℹ️ Billbee skipped non-FBM SKUs: ' . $skippedNonFbm);
 }
@@ -1867,10 +1856,12 @@ if ($failVO > 0 || $failBB > 0) {
 
   $to_email = 'info@feela.de'; // change/add more recipients if needed
 
+  $ventoryEmailSummary = 'Skipped (integration disabled) — ' . $voSkippedCount . ' SKUs not sent to VentoryOne';
+
   $subject = "⚠️ Inventory Sync Failures on " . date('Y-m-d H:i');
   $htmlBody = "<h2>Inventory Sync Report</h2>"
             . "<p><b>Date:</b> " . date('Y-m-d H:i:s') . "</p>"
-            . "<p><b>VentoryOne:</b> $okVO OK / $failVO Fail</p>"
+            . "<p><b>VentoryOne:</b> " . $ventoryEmailSummary . "</p>"
             . "<p><b>Billbee:</b> $okBB OK / $failBB Fail</p>"
             . "<p>See attached log for details.</p>";
 
